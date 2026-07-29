@@ -62,6 +62,7 @@ USBForge 是一个集成了 USB 总线监听、MITM 中继、流量分析、数�
 
 ### 安装
 
+**macOS / Linux:**
 ```bash
 git clone https://github.com/da1sy/USBForge.git
 cd USBForge
@@ -71,6 +72,18 @@ python3 -m venv .venv
 
 # 安装依赖
 .venv/bin/pip install cynthion facedancer textual rich pyusb pyfiglet
+```
+
+**Windows:**
+```cmd
+git clone https://github.com/da1sy/USBForge.git
+cd USBForge
+
+# 创建虚拟环境
+python -m venv .venv
+
+# 安装依赖（Windows 需要 libusb 包提供 USB 后端）
+.venv\Scripts\pip install cynthion facedancer textual rich pyusb pyfiglet libusb
 ```
 
 ### 运行
@@ -84,6 +97,20 @@ python3 -m venv .venv
 ```cmd
 run.bat
 ```
+
+### ⚠️ Windows USB 驱动说明
+
+Windows 上 pyusb 需要 `libusb-1.0.dll` 作为 USB 后端。USBForge 通过 `pip install libusb` 自动解决，**无需 Zadig / WinUSB 手动安装驱动**。
+
+原理：
+- `libusb` PyPI 包内置了 Windows 版 `libusb-1.0.dll`（x86_64 / arm64）
+- `tui.py` 启动时自动预加载 DLL 到进程地址空间
+- `run.bat` 将 DLL 目录加入 PATH 作为 fallback
+
+如果运行后无法检测到 Cynthion 设备，检查：
+1. 确认已 `pip install libusb`
+2. 确认 Cynthion 已插入 USB 口
+3. 在设备页按 `D` 刷新设备状态
 
 ### 快捷键
 
