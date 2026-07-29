@@ -4,6 +4,8 @@
 
 USBForge 是一个集成了 USB 总线监听、MITM 中继、流量分析、数据包注入、设备伪造、模糊测试于一体的终端 (TUI) 安全工具。底层基于 [Cynthion](https://github.com/greatscottgadgets/cynthion) 硬件平台和 [Facedancer](https://github.com/greatscottgadgets/facedancer) 框架，提供图形化的交互操作界面，专为 IoT 设备、嵌入式系统、智能硬件的 USB 协议安全审计场景设计。
 
+![USBForge 界面总览](screenshots/usbforge_00_overview.png)
+
 ---
 
 ## 📸 界面预览
@@ -14,8 +16,8 @@ USBForge 是一个集成了 USB 总线监听、MITM 中继、流量分析、数�
 ### 总线监听
 ![监听](screenshots/usbforge_02_sniff.png)
 
-### 流量分析
-![分析](screenshots/usbforge_03_analyze.png)
+### MITM 中继
+![中继](screenshots/usbforge_03_relay.png)
 
 ### 数据包注入
 ![注入](screenshots/usbforge_04_inject.png)
