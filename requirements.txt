@@ -1,0 +1,6 @@
+cynthion
+facedancer
+textual>=8.0
+rich>=13.0
+pyusb
+pyfiglet
