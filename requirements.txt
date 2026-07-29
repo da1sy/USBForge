@@ -4,3 +4,4 @@ textual>=8.0
 rich>=13.0
 pyusb
 pyfiglet
+libusb; sys_platform == 'win32'

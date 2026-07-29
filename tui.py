@@ -27,6 +27,24 @@ if "PYTHONPATH" in _os.environ:
     else:
         _os.environ.pop("PYTHONPATH", None)
 _sys.path = [p for p in _sys.path if "hermes-agent" not in p and "hermes/hermes-agent" not in p]
+
+# ══ Windows: 预加载 libusb-1.0.dll (pyusb 需要) ══
+if _sys.platform == "win32":
+    import ctypes as _ctypes
+    try:
+        import libusb as _libusb_pkg
+        _dll_dir = _os.path.join(_os.path.dirname(_libusb_pkg.__file__),
+                                 "_platform", "windows", "x86_64")
+        if not _os.path.isdir(_dll_dir):
+            _dll_dir = _os.path.join(_os.path.dirname(_libusb_pkg.__file__),
+                                     "_platform", "windows", "arm64")
+        _dll_path = _os.path.join(_dll_dir, "libusb-1.0.dll")
+        if _os.path.isfile(_dll_path):
+            _ctypes.CDLL(_dll_path)
+            _os.environ["PATH"] = _dll_dir + _os.pathsep + _os.environ.get("PATH", "")
+    except Exception:
+        pass  # libusb 包未安装或 DLL 不存在，静默跳过
+
 import site as _site
 _us = _site.getusersitepackages()
 if _us not in _sys.path:
