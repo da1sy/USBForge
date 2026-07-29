@@ -75,8 +75,14 @@ python3 -m venv .venv
 
 ### 运行
 
+**macOS / Linux:**
 ```bash
 ./run.sh
+```
+
+**Windows:**
+```cmd
+run.bat
 ```
 
 ### 快捷键
@@ -103,7 +109,8 @@ USBForge/
 ├── strategy.py         # 模糊测试策略引擎
 ├── usb_fuzzer.py       # 核心模糊执行器
 ├── mcp_bridge.py       # MCP 服务器桥接层 (JSON-RPC 2.0)
-├── run.sh              # 启动脚本
+├── run.sh              # 启动脚本 (macOS/Linux)
+├── run.bat             # 启动脚本 (Windows)
 ├── screenshots/        # 工具截图
 ├── exports/            # 描述符导出文件
 └── corpus/             # 模糊测试崩溃语料

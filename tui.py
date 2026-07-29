@@ -13,7 +13,7 @@ USBForge v3.0 — 基于 Cynthion 的全功能 USB 安全工具套件
   📊  统计   — 全局统计、活动日志
   ℹ️  关于   — 工具介绍、技术栈、快捷键
 
-运行: ./run.sh  (使用 Cynthion .venv Python 3.12)
+运行: ./run.sh (macOS/Linux)  或  run.bat (Windows)
 """
 
 # ══ 环境修复 — 必须在所有其他 import 之前 ══
@@ -103,8 +103,23 @@ _SCRIPT_DIR = _os.path.dirname(_os.path.abspath(__file__))
 _VENV_DIR = _os.path.dirname(_SCRIPT_DIR) + "/.venv"
 if not _os.path.isdir(_VENV_DIR):
     _VENV_DIR = _SCRIPT_DIR + "/.venv"  # fallback: local venv
-_MCP_SERVER_PATH = f"{_VENV_DIR}/bin/cynthion-mcp"
-_CLAUDE_CONFIG_DIR = str(Path.home() / "Library" / "Application Support" / "Claude")
+if _sys.platform == "win32":
+    _PYTHON_BIN = _os.path.join(_VENV_DIR, "Scripts", "python.exe")
+    _MCP_SERVER_PATH = _os.path.join(_VENV_DIR, "Scripts", "cynthion-mcp.exe")
+    _CLAUDE_CONFIG_DIR = _os.path.join(_os.environ.get("APPDATA", ""), "Claude")
+    _SERIAL_DEFAULT = "COM3"
+    _SERIAL_CHOICES = [("COM1", "COM1"), ("COM2", "COM2"), ("COM3", "COM3"),
+                       ("COM4", "COM4"), ("COM5", "COM5")]
+else:
+    _PYTHON_BIN = _os.path.join(_VENV_DIR, "bin", "python3")
+    _MCP_SERVER_PATH = _os.path.join(_VENV_DIR, "bin", "cynthion-mcp")
+    _CLAUDE_CONFIG_DIR = str(Path.home() / "Library" / "Application Support" / "Claude")
+    _SERIAL_DEFAULT = "/dev/ttyUSB0"
+    _SERIAL_CHOICES = [("/dev/ttyUSB0", "/dev/ttyUSB0"),
+                       ("/dev/ttyUSB1", "/dev/ttyUSB1"),
+                       ("/dev/ttyS0", "/dev/ttyS0"),
+                       ("/dev/cu.SLAB_USBtoUART", "/dev/cu.SLAB_USBtoUART"),
+                       ("/dev/cu.usbserial", "/dev/cu.usbserial")]
 _HERMES_CONFIG_DIR = str(Path.home() / ".hermes")
 
 
@@ -998,13 +1013,9 @@ class USBForgeApp(App):
                 # ── UART 字段 ──
                 with Vertical(id="fuzz-uart-fields", classes="fuzz-target-section"):
                     yield Select(
-                        [("/dev/ttyUSB0", "/dev/ttyUSB0"),
-                         ("/dev/ttyUSB1", "/dev/ttyUSB1"),
-                         ("/dev/ttyS0", "/dev/ttyS0"),
-                         ("/dev/cu.SLAB_USBtoUART", "/dev/cu.SLAB_USBtoUART"),
-                         ("/dev/cu.usbserial", "/dev/cu.usbserial")],
+                        _SERIAL_CHOICES,
                         id="fuzz-uart-port",
-                        value="/dev/ttyUSB0",
+                        value=_SERIAL_DEFAULT,
                         classes="fuzz-full-select",
                     )
                     with Horizontal(classes="btn-row"):
@@ -1776,7 +1787,9 @@ class USBForgeApp(App):
             try:
                 # 使用 cynthion flash 刷写持久 bitstream
                 import subprocess
-                cynthion_bin = "/Users/da1sy/tools/cynthion/.venv/bin/cynthion"
+                cynthion_bin = _os.path.join(_VENV_DIR,
+                    "Scripts" if _sys.platform == "win32" else "bin", "cynthion"
+                    + (".exe" if _sys.platform == "win32" else ""))
 
                 self.call_from_thread(self._log_device,
                     f"[dim]正在持久刷写 {target} bitstream 到 SPI flash（约30-90秒）...[/]")
@@ -2962,7 +2975,7 @@ class USBForgeApp(App):
                 self._log_fuzz_info("[dim]无Shell模式 — 仅依赖 USB 枚举变化检测[/]")
             elif conn_type == "uart":
                 self._monitor = create_monitor(
-                    mode="noshell", target_ip=target_ip or "/dev/ttyUSB0",
+                    mode="noshell", target_ip=target_ip or _SERIAL_DEFAULT,
                     ssh_user=ssh_user,
                 )
                 self._log_fuzz_info(f"[green]✓ 串口监控: {target_ip}[/]")
