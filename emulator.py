@@ -363,6 +363,7 @@ class DeviceEmulator:
         self.current_profile = profile
         self.vid_override = vid_override or profile.vid
         self.pid_override = pid_override or profile.pid
+        profile._speed = speed  # 传递给 _emulate_worker
 
         # 构造描述符
         descriptor = build_descriptor_set(profile)
@@ -399,47 +400,132 @@ class DeviceEmulator:
         self._notify({"event": "emulation_stopped"})
 
     def _emulate_worker(self, profile: DeviceProfile, descriptor: bytes):
-        """仿真工作线程"""
+        """仿真工作线程 — 通过 Facedancer/Cynthion 真正仿真 USB 设备"""
         try:
-            # 尝试通过 Facedancer 创建设备
-            try:
-                from facedancer.core import FacedancerUSBApp
-                from facedancer import USBDevice
+            import asyncio
+            from facedancer.types import DeviceSpeed, USBDirection, USBTransferType
 
-                # 创建 Facedancer 应用
-                # app = FacedancerUSBApp()
-                # device = USBDevice.from_binary_descriptor(descriptor)
-                # device.connect(app)
-                # app.run()
+            # 映射速度字符串
+            speed_map = {
+                "low":  DeviceSpeed.LOW,
+                "full": DeviceSpeed.FULL,
+                "high": DeviceSpeed.HIGH,
+                "auto": DeviceSpeed.FULL,
+            }
+            device_speed = speed_map.get(getattr(profile, '_speed', 'full'), DeviceSpeed.FULL)
 
-                self._notify({
-                    "event": "facedancer_connecting",
-                    "message": f"正在通过 Facedancer 连接 {profile.name}...",
-                })
+            self._notify({
+                "event": "facedancer_connecting",
+                "message": f"正在通过 Cynthion Facedancer 仿真 {profile.name}...",
+            })
+
+            # 创建 asyncio 事件循环（Facedancer run() 是 async）
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            # 用 Facedancer 高层 API 构建 USB 设备
+            from facedancer import USBDevice, USBConfiguration, USBInterface, USBEndpoint
+
+            # 构建 endpoints / interfaces / configuration
+            ep_type_map = {
+                "control":   USBTransferType.CONTROL,
+                "iso":       USBTransferType.ISOCHRONOUS,
+                "bulk":      USBTransferType.BULK,
+                "interrupt": USBTransferType.INTERRUPT,
+            }
+
+            device = USBDevice(
+                name=profile.name,
+                device_class=profile.device_class,
+                device_subclass=profile.subclass,
+                protocol_revision_number=profile.protocol,
+                max_packet_size_ep0=profile.max_packet_ep0,
+                vendor_id=self.vid_override,
+                product_id=self.pid_override,
+                manufacturer_string=profile.manufacturer,
+                product_string=profile.product,
+                serial_number_string=profile.serial,
+                usb_spec_version=(profile.usb_version[0] << 8) | profile.usb_version[1],
+            )
+
+            # 添加配置 + 接口 + 端点
+            config = USBConfiguration(
+                max_power=profile.max_power_ma,
+                self_powered=profile.self_powered,
+            )
+
+            for i, iface_def in enumerate(profile.interfaces):
+                iface = USBInterface(
+                    number=i,
+                    class_number=iface_def.get("class", 0),
+                    subclass_number=iface_def.get("subclass", 0),
+                    protocol_number=iface_def.get("protocol", 0),
+                )
+                for ep_def in iface_def.get("endpoints", []):
+                    ep_addr = ep_def.get("addr", 0x81)
+                    direction = USBDirection.IN if (ep_addr & 0x80) else USBDirection.OUT
+                    ep = USBEndpoint(
+                        number=ep_addr & 0x0F,
+                        direction=direction,
+                        transfer_type=ep_type_map.get(ep_def.get("type", "interrupt"),
+                                                      USBTransferType.INTERRUPT),
+                        max_packet_size=ep_def.get("size", 64),
+                        interval=ep_def.get("interval", 0),
+                    )
+                    iface.add_endpoint(ep)
+                config.add_interface(iface)
+
+            device.add_configuration(config)
+
+            self._notify({
+                "event": "facedancer_device_built",
+                "message": f"设备已构建: {profile.name}",
+                "vid": f"0x{self.vid_override:04x}",
+                "pid": f"0x{self.pid_override:04x}",
+                "num_interfaces": len(profile.interfaces),
+            })
+
+            # 连接硬件并运行仿真
+            device.connect(device_speed=device_speed)
+
+            self._facedancer_device = device
+            self._notify({
+                "event": "facedancer_connected",
+                "message": f"设备已仿真: {profile.name} (VID={self.vid_override:04x} PID={self.pid_override:04x})",
+            })
+
+            # 运行 Facedancer 主循环（async），直到收到停止信号
+            # 使用异步方式以便能响应停止请求
+            async def _run_until_stopped():
+                while not self._stop_event.is_set():
+                    device.backend.service_irqs()
+                    await asyncio.sleep(0.001)
+
+            loop.run_until_complete(_run_until_stopped())
+
+        except ImportError:
+            self._notify({
+                "event": "facedancer_unavailable",
+                "message": "Facedancer 未安装 — 使用模拟模式",
+            })
+            while not self._stop_event.is_set():
                 time.sleep(0.5)
 
-                # 在实际硬件上运行仿真
-                # 暂时使用模拟模式
-                self._notify({
-                    "event": "facedancer_connected",
-                    "message": f"设备已仿真: {profile.name} (VID={self.vid_override:04x} PID={self.pid_override:04x})",
-                })
-
-                # 等待停止信号
-                while not self._stop_event.is_set():
-                    time.sleep(0.3)
-
-            except ImportError:
-                self._notify({
-                    "event": "facedancer_unavailable",
-                    "message": "Facedancer 未安装 — 使用模拟模式",
-                })
-                while not self._stop_event.is_set():
-                    time.sleep(0.5)
-
         except Exception as e:
-            self._notify({"event": "error", "message": str(e)})
+            import traceback
+            self._notify({
+                "event": "error",
+                "message": str(e),
+                "traceback": traceback.format_exc(),
+            })
         finally:
+            # 断开设备
+            if self._facedancer_device:
+                try:
+                    self._facedancer_device.disconnect()
+                except Exception:
+                    pass
+                self._facedancer_device = None
             self.is_emulating = False
 
     def inject_descriptor(self, descriptor_hex: str) -> bool:

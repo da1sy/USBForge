@@ -70,6 +70,26 @@ PID_MAP = {
     0xb4: ("PING", PacketType.PING),
 }
 
+# MCP tshark PID names → PacketType (tshark uses lowercase hex PID values)
+# Maps the pid_name strings from summarise_packet() to our PacketType enum
+_PID_NAME_TO_TYPE = {
+    "SOF": PacketType.SOF,
+    "SETUP": PacketType.SETUP,
+    "IN": PacketType.IN,
+    "OUT": PacketType.OUT,
+    "SPLIT": PacketType.SPLIT,
+    "PING": PacketType.PING,
+    "DATA0": PacketType.DATA0,
+    "DATA1": PacketType.DATA1,
+    "DATA2": PacketType.DATA0,
+    "MDATA": PacketType.DATA0,
+    "ACK": PacketType.ACK,
+    "NAK": PacketType.NAK,
+    "STALL": PacketType.STALL,
+    "NYET": PacketType.NAK,
+    "PRE_OR_ERR": PacketType.STALL,
+}
+
 
 @dataclass
 class USBPacket:
@@ -264,6 +284,7 @@ class USBSniffer:
         self._max_packets = 10000  # ring buffer
         self._callbacks: list[Callable] = []
         self.current_capture_file: Optional[Path] = None
+        self.last_capture_id: Optional[str] = None  # MCP capture_id of last session
 
     def add_callback(self, cb: Callable):
         self._callbacks.append(cb)
@@ -276,11 +297,13 @@ class USBSniffer:
                 pass
 
     def start(self, speed: str = "auto") -> bool:
-        """启动捕获 (需要 analyzer bitstream)"""
+        """启动捕获 (需要 analyzer bitstream)
+
+        首先尝试通过 MCP bridge 做真实捕获；若 MCP 不可用则降级模拟。
+        """
         if self.is_capturing:
             return True
 
-        # 确保捕获目录存在
         _CAP_DIR.mkdir(parents=True, exist_ok=True)
         self.current_capture_file = _CAP_DIR / f"capture_{int(time.time())}.bin"
 
@@ -303,7 +326,7 @@ class USBSniffer:
         self.is_capturing = False
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=3)
+            self._thread.join(timeout=5)
             self._thread = None
 
         return {
@@ -311,60 +334,133 @@ class USBSniffer:
             "elapsed": self.stats.elapsed,
             "pps": self.stats.pps,
             "capture_file": str(self.current_capture_file) if self.current_capture_file else "",
+            "capture_id": self.last_capture_id or "",
         }
 
     def _capture_worker(self, speed: str):
-        """捕获工作线程"""
-        # 尝试使用 cynthion analyzer
-        # 注意: 实际捕获需要切换到 analyzer bitstream
-        # 这里通过 subprocess 调用 cynthion CLI 或直接使用 luna-soc
-        try:
-            # 方法1: 通过 MCP server 提供的 capture API (如果有运行中的 server)
-            # 方法2: 直接 cynthion run analyzer
-            # 方法3: 读取已有捕获文件
-            self._capture_via_luna(speed)
-        except Exception as e:
-            # 降级: 模拟模式
-            self._capture_simulated()
+        """捕获工作线程 — 优先 MCP 真实捕获，否则降级模拟。
 
-    def _capture_via_luna(self, speed: str):
-        """通过 luna-soc analyzer 捕获"""
+        真实模式流程:
+          1. bridge.capture_start(speed)  → 得到 capture_id
+          2. 捕获进行中，capture_status 轮询
+          3. 用户点 Stop 时 stop() 置 _stop_event
+          4. bridge.capture_stop()
+          5. bridge.dissect_packets(capture_id) → tshark 结构化结果
+          6. 转换为 USBPacket 对象，逐条回调 UI
+        """
         try:
-            # 尝试加载已有的捕获文件
-            if _CAP_DIR.exists():
-                captures = sorted(_CAP_DIR.glob("*.bin"), key=lambda p: p.stat().st_mtime, reverse=True)
-                if captures:
-                    self._parse_capture_file(captures[0])
-                    return
-            # 没有文件则等待
-            while not self._stop_event.is_set():
-                time.sleep(0.5)
+            from mcp_bridge import get_bridge
+            bridge = get_bridge()
+            if bridge.available or bridge.start(timeout=15):
+                self._capture_via_mcp(bridge, speed)
+            else:
+                self._capture_simulated()
         except Exception:
             self._capture_simulated()
 
-    def _parse_capture_file(self, filepath: Path):
-        """解析已有捕获文件"""
-        try:
-            data = filepath.read_bytes()
-            # 简单解析: 每帧前 4 字节时间戳 + PID
-            i = 0
-            while i < len(data) - 4 and not self._stop_event.is_set():
-                pid_byte = data[i + 2] if i + 2 < len(data) else 0
-                pid_name, ptype = PID_MAP.get(pid_byte, ("?", PacketType.ACK))
-                pkt = USBPacket(
-                    timestamp=time.time(),
-                    pid=pid_byte,
-                    pid_name=pid_name,
-                    packet_type=ptype,
-                    data=data[i+4:i+68] if i + 68 < len(data) else data[i+4:],
-                )
+    def _capture_via_mcp(self, bridge, speed: str):
+        """通过 MCP bridge 调用真实 Cynthion analyzer 捕获"""
+        # 1) 启动捕获
+        r = bridge.capture_start(speed)
+        if not r.get("ok"):
+            self._capture_simulated()
+            return
+
+        cap_data = r.get("data", {})
+        self.last_capture_id = cap_data.get("id", "")
+
+        # 2) 等待用户停止 — 轮询 capture_status 保持活跃
+        while not self._stop_event.is_set():
+            st = bridge.capture_status()
+            # 只要 bridge 还活着就继续
+            if not st.get("ok"):
+                break
+            time.sleep(0.3)
+
+        # 3) 停止捕获
+        stop_r = bridge.capture_stop()
+        if stop_r.get("ok"):
+            stop_data = stop_r.get("data", {})
+            # capture_stop 返回 "id" 而非 "capture_id"
+            self.last_capture_id = stop_data.get("id", self.last_capture_id)
+
+        # 4) 解析捕获数据 — 调用 dissect_packets 获取结构化包
+        if self.last_capture_id:
+            self._load_packets_from_mcp(bridge, self.last_capture_id)
+
+    def _load_packets_from_mcp(self, bridge, capture_id: str, limit: int = 500):
+        """从 MCP dissect_packets 结果加载真实数据包到 self.packets"""
+        r = bridge.dissect_packets(capture_id, limit=limit)
+        if not r.get("ok"):
+            return
+
+        data = r.get("data", {})
+        pkts = data.get("packets", [])
+        for p in pkts:
+            pkt = self._mcp_packet_to_usbpacket(p)
+            if pkt:
                 self._add_packet(pkt)
-                i += 64  # 粗略的帧间距
+
+    @staticmethod
+    def _mcp_packet_to_usbpacket(p: dict) -> Optional['USBPacket']:
+        """将 MCP tshark summarise_packet 结果转为 USBPacket"""
+        try:
+            pid_str = p.get("pid") or ""
+            pid_val = int(pid_str, 16) if isinstance(pid_str, str) else 0
+            pid_name = p.get("pid_name") or ""
+            ptype = _PID_NAME_TO_TYPE.get(pid_name, PacketType.ACK)
+
+            dev_addr = 0
+            dev = p.get("device")
+            if dev is not None:
+                dev_addr = int(dev)
+
+            ep_val = 0
+            ep = p.get("endpoint")
+            if ep is not None:
+                ep_val = int(ep)
+
+            # direction from src/dst
+            src = p.get("src") or ""
+            dst = p.get("dst") or ""
+            if "host" in src.lower():
+                direction = "OUT"
+            elif "host" in dst.lower():
+                direction = "IN"
+            else:
+                direction = ""
+
+            # extra fields may contain data payload
+            extra = p.get("extra") or {}
+            raw_data = b""
+            for k, v in extra.items():
+                if isinstance(v, str) and all(c in "0123456789abcdef:" for c in v.lower()):
+                    cleaned = v.replace(":", "")
+                    try:
+                        raw_data = bytes.fromhex(cleaned)
+                        if len(raw_data) > 0:
+                            break
+                    except ValueError:
+                        continue
+
+            ts = p.get("time", 0.0)
+
+            return USBPacket(
+                timestamp=float(ts) if ts else time.time(),
+                pid=pid_val,
+                pid_name=pid_name,
+                packet_type=ptype,
+                device_addr=dev_addr,
+                endpoint=ep_val,
+                data=raw_data,
+                direction=direction,
+                raw_hex=raw_data.hex() if raw_data else "",
+            )
         except Exception:
-            pass
+            return None
 
     def _capture_simulated(self):
-        """模拟模式 — 生成示例流量用于 UI 演示"""
+        """模拟模式 — 生成示例流量用于 UI 演示 (无硬件时降级)"""
         import random
         rng = random.Random()
 
@@ -426,16 +522,16 @@ class USBSniffer:
             filepath = _CAP_DIR / f"export_{int(time.time())}.pcap"
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
-        # LINKTYPE_USB_2_0 = 248
+        # LINKTYPE_USB_2_0 = 288, the linktype consumed by Wireshark/tshark USB dissector
         with open(filepath, "wb") as f:
-            # pcap global header
-            f.write(b"\xd4\xc3\xb2\xa1")  # magic
+            # pcap global header (little-endian, microsecond timestamps)
+            f.write(b"\xd4\xc3\xb2\xa1")  # magic (little-endian host byte order)
             f.write((2).to_bytes(2, "little"))  # version major
             f.write((4).to_bytes(2, "little"))  # version minor
             f.write((0).to_bytes(4, "little"))  # thiszone
             f.write((0).to_bytes(4, "little"))  # sigfigs
             f.write((65535).to_bytes(4, "little"))  # snaplen
-            f.write((248).to_bytes(4, "little"))  # LINKTYPE_USB_2_0
+            f.write((288).to_bytes(4, "little"))  # LINKTYPE_USB_2_0 = 288 (not 248)
 
             for pkt in self.packets:
                 ts = int(pkt.timestamp)

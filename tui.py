@@ -820,7 +820,9 @@ class USBForgeApp(App):
                 with Horizontal(classes="btn-row"):
                     yield Button("🔍 解析描述符", id="btn-parse-desc", variant="success")
                     yield Button("🗑 清空", id="btn-clear-desc")
-                yield Button("📋 填入示例描述符", id="btn-sample-desc")
+                with Horizontal(classes="btn-row"):
+                    yield Button("📋 填入示例描述符", id="btn-sample-desc")
+                    yield Button("📥 从抓包加载", id="btn-load-from-sniff", variant="primary")
 
                 yield Label("描述符类型统计", classes="section-label")
                 yield DataTable(id="desc-type-table")
@@ -1930,54 +1932,38 @@ class USBForgeApp(App):
     def _do_sniff_start(self):
         speed = self.query_one("#select-sniff-speed", Select).value
         self.stats.sniff_packets = 0
+        self.stats.sniff_start_time = time.time()
         self._init_sniff_table()
 
-        # 尝试通过 MCP bridge 启动真实捕获
         bridge = get_bridge()
-        if bridge.available:
-            def _do_mcp_capture():
-                result = bridge.capture_start(speed)
-                if result.get("ok"):
-                    self.call_from_thread(self._log_device,
-                        f"[green]✓ MCP 捕获已启动 ({speed})[/]")
-                else:
-                    self.call_from_thread(self._log_device,
-                        f"[yellow]⚠ MCP 捕获启动失败: {result.get('error', '?')}[/]")
-            threading.Thread(target=_do_mcp_capture, daemon=True).start()
-        else:
-            self._log_device("[dim]MCP 不可用，使用模拟模式[/]")
+        if not bridge.available:
+            if not bridge.start(timeout=10):
+                self._log_device("[yellow]⚠ MCP 不可用，使用模拟模式（数据非真实）[/]")
 
-        # 同时启动 UI 模拟流以保持实时显示
+        # 启动 sniffer (内部自动选择 MCP 真实捕获 或 模拟模式)
         self.sniffer.start(speed)
         self._start_sniff_updater()
+        self._log_device(f"[green]▶ 捕获已启动 ({speed})[/]")
 
     def _on_btn_sniff_stop(self):
         result = self.sniffer.stop()
 
-        # 如果 MCP bridge 在捕获，也停止它
-        bridge = get_bridge()
-        if bridge.available:
-            def _do_mcp_stop():
-                mcp_result = bridge.capture_stop()
-                if mcp_result.get("ok"):
-                    self.call_from_thread(self._log_device,
-                        f"[green]✓ MCP 捕获已停止[/]")
-                    # 自动转换为 pcap
-                    data = mcp_result.get("data", {})
-                    if isinstance(data, dict):
-                        capture_id = data.get("capture_id", "")
-                        if capture_id:
-                            self.call_from_thread(self._log_device,
-                                f"[dim]捕获 ID: {capture_id}[/]")
-                else:
-                    self.call_from_thread(self._log_device,
-                        f"[yellow]⚠ MCP 停止失败: {mcp_result.get('error', '?')}[/]")
-            threading.Thread(target=_do_mcp_stop, daemon=True).start()
-
-        # log to detail panel
+        # 显示停止信息
         try:
             self.query_one("#sniff-packet-detail", RichLog).write(
                 f"[red]⏹ 捕获已停止 — {result['total_packets']} 包, {result['elapsed']:.1f}s[/]")
+            cap_id = result.get("capture_id", "")
+            if cap_id:
+                self.query_one("#sniff-packet-detail", RichLog).write(
+                    f"[dim]捕获 ID: {cap_id}[/]")
+                # 自动转换为 pcap 以便 Wireshark 分析
+                bridge = get_bridge()
+                if bridge.available:
+                    pcap_r = bridge.convert_to_pcap(cap_id)
+                    if pcap_r.get("ok"):
+                        pd = pcap_r.get("data", {})
+                        self.query_one("#sniff-packet-detail", RichLog).write(
+                            f"[green]✓ PCAP 已生成: {pd.get('packets', 0)} 包[/]")
         except:
             pass
 
@@ -2276,6 +2262,44 @@ class USBForgeApp(App):
     def _on_btn_clear_desc(self):
         self.query_one("#input-desc-hex", Input).value = ""
         self.query_one("#analyze-log", RichLog).clear()
+
+    def _on_btn_load_from_sniff(self):
+        """从 sniffer 已捕获的包中提取描述符和 SETUP 数据，自动填入分析栏"""
+        packets = self.sniffer.packets if hasattr(self, "sniffer") else []
+        if not packets:
+            self._log_analyze("[yellow]⚠ 没有已捕获的数据包 — 先在「监听」标签页抓包[/]")
+            return
+
+        # 提取 DATA 包中的描述符 (通常紧跟 SETUP GET_DESCRIPTOR)
+        desc_hex_all = []
+        setup_hex_all = []
+        for pkt in packets:
+            if pkt.is_setup and pkt.data_len >= 8:
+                # SETUP 请求 — bmRequestType[0] + bRequest[1]
+                if pkt.data[0] in (0x80, 0x00) and pkt.data[1] in (6, 7):
+                    setup_hex_all.append(pkt.data[:8].hex())
+            if pkt.is_data and pkt.data_len >= 2:
+                desc_type_byte = pkt.data[1] if len(pkt.data) > 1 else 0
+                if desc_type_byte in (1, 2, 4, 5, 0x21, 0x22, 0x24, 0x29):
+                    desc_hex_all.append(pkt.data.hex())
+
+        # 填入最大的描述符（通常是完整 Configuration descriptor）
+        if desc_hex_all:
+            best = max(desc_hex_all, key=len)
+            self.query_one("#input-desc-hex", Input).value = best
+            self._log_analyze(f"[green]✓ 已加载 {len(desc_hex_all)} 个描述符包 (最长 {len(best)//2} 字节)[/]")
+            self._on_btn_parse_desc()
+        else:
+            self._log_analyze("[yellow]未在捕获数据中找到描述符[/]")
+
+        # 填入最后一个 SETUP 请求
+        if setup_hex_all:
+            self.query_one("#input-setup-hex", Input).value = setup_hex_all[-1]
+            self._log_analyze(f"[green]✓ 已加载 {len(setup_hex_all)} 个 SETUP 请求[/]")
+
+        # 自动解析 SETUP
+        if setup_hex_all:
+            self._on_btn_parse_setup()
 
     def _on_btn_parse_setup(self):
         hex_str = self.query_one("#input-setup-hex", Input).value.strip()
@@ -2671,7 +2695,7 @@ class USBForgeApp(App):
         self._ensure_mode("facedancer", "USB 中继 (MITM)", self._do_relay_start)
 
     def _do_relay_start(self):
-        """启动中继模式"""
+        """启动中继模式 — 通过 MCP 捕获真实 USB 流量"""
         policy = self.query_one("#select-relay-policy", Select).value
         self._relay_active = True
         self._relay_policy = policy
@@ -2690,20 +2714,40 @@ class USBForgeApp(App):
             "data": "拦截 DATA",
             "all": "拦截全部",
         }
-        self._log_relay(f"[green]▶ 中继已启动 — 策略: {policy_names.get(policy, policy)}[/]")
-        self._log_relay("[dim]等待 USB 事务...[/]")
 
-        # 启动后台模拟线程
-        self._relay_thread = threading.Thread(target=self._relay_loop, daemon=True)
+        # 初始化 MCP bridge
+        bridge = get_bridge()
+        if not bridge.available:
+            if not bridge.start(timeout=10):
+                self._log_relay("[red]❌ MCP 不可用 — 无法启动真实中继[/]")
+                self._log_relay("[yellow]请确保 Cynthion 已连接并加载 analyzer 固件[/]")
+                self._relay_active = False
+                return
+
+        self._log_relay(f"[green]▶ 中继已启动 — 策略: {policy_names.get(policy, policy)}[/]")
+        self._log_relay("[dim]通过 MCP 捕获真实 USB 流量 (Cynthion passthrough)...[/]")
+
+        # 启动真实捕获线程
+        self._relay_thread = threading.Thread(target=self._relay_loop_mcp, daemon=True)
         self._relay_thread.start()
 
     def _on_btn_relay_stop(self):
         """停止中继"""
         self._relay_active = False
+        # 停止 MCP 捕获
+        bridge = get_bridge()
+        if bridge.available:
+            def _do_stop():
+                r = bridge.capture_stop()
+                if r.get("ok"):
+                    data = r.get("data", {})
+                    self.call_from_thread(self._log_relay,
+                        f"[dim]MCP 捕获停止 — {data.get('bytes_written', 0)} bytes[/]")
+            threading.Thread(target=_do_stop, daemon=True).start()
         self._log_relay("[red]⏹ 中继已停止[/]")
 
     def _on_btn_relay_forward(self):
-        """放行选中的包"""
+        """放行选中的包 — 标记为已转发"""
         table = self.query_one("#relay-queue-table", DataTable)
         if table.row_count == 0:
             self._log_relay("[yellow]队列为空，无包可操作[/]")
@@ -2751,7 +2795,7 @@ class USBForgeApp(App):
             self._log_relay(f"[red]丢弃失败: {e}[/]")
 
     def _on_btn_relay_send(self):
-        """发送修改后的数据"""
+        """发送修改后的数据 — 通过 MCP inject_serial 实际注入"""
         edit_hex = self.query_one("#input-relay-edit", Input).value.strip()
         table = self.query_one("#relay-queue-table", DataTable)
         if not table.cursor_coordinate or not edit_hex:
@@ -2773,87 +2817,169 @@ class USBForgeApp(App):
                 table.update_row(row_key.value, str(row_idx), pkt["dir"], pkt["type"],
                                  pkt["dev"], pkt["ep"], pkt["req"], str(pkt["len"]),
                                  "🔧 已篡改")
-                self._log_relay(f"[yellow]🔧 包 #{row_idx} 数据已修改 ({len(modified_bytes)} bytes) → 转发[/]")
+                self._log_relay(f"[yellow]🔧 包 #{row_idx} 数据已修改 ({len(modified_bytes)} bytes)[/]")
                 self._update_relay_stats()
 
-                # 通过 MCP 发送修改后的数据
+                # 通过 MCP inject_serial 实际发送修改后的数据
                 bridge = get_bridge()
-                if bridge.available:
-                    self._log_relay(f"[dim]MCP: 发送修改后的数据到目标...[/]")
+                if not bridge.available:
+                    self._log_relay("[yellow]⚠ MCP 不可用，无法实际发送 — 数据仅标记为已篡改[/]")
+                    return
+
+                self._log_relay("[dim]正在通过 MCP 发送修改后的数据...[/]")
+
+                def _do_inject():
+                    # inject_serial 要求 facedancer 模式 + 活跃的 FTDI 仿真
+                    # 先尝试直接注入
+                    r = bridge.inject_serial(modified_bytes.decode("latin-1"))
+                    if r.get("ok"):
+                        self.call_from_thread(self._log_relay,
+                            f"[green]✅ 已通过 MCP 发送 {len(modified_bytes)} bytes 修改数据[/]")
+                    else:
+                        err = r.get("error", "?")
+                        self.call_from_thread(self._log_relay,
+                            f"[yellow]⚠ inject_serial 失败: {err}[/]")
+                        self.call_from_thread(self._log_relay,
+                            "[dim]提示: 篡改注入需要先在「伪造」标签页启动 FTDI 设备仿真[/]")
+
+                threading.Thread(target=_do_inject, daemon=True).start()
+
         except ValueError:
             self._log_relay("[red]hex 格式错误[/]")
         except Exception as e:
             self._log_relay(f"[red]发送失败: {e}[/]")
 
-    def _relay_loop(self):
-        """后台模拟中继数据流"""
-        import random as _rng
-        _rng = _rng.Random()
-        packet_types = [("SETUP", "06"), ("DATA IN", "-"), ("DATA OUT", "-"),
-                        ("ACK", "-"), ("STATUS", "00")]
-        directions = ["IN←", "OUT→"]
+    def _relay_loop_mcp(self):
+        """真实中继数据流 — 通过 MCP capture 捕获 USB 流量并实时显示
+
+        流程:
+          1. bridge.capture_start() 启动 passthrough 捕获
+          2. 轮询 capture_status，定期 dissect_packets 获取新包
+          3. 将真实包转为 relay_queue 条目
+          4. 根据 policy 决定 HELD/FORWARDED
+        """
+        bridge = get_bridge()
+
+        # 1) 启动 MCP 捕获
+        r = bridge.capture_start("auto")
+        if not r.get("ok"):
+            self.call_from_thread(self._log_relay,
+                f"[red]❌ MCP 捕获启动失败: {r.get('error', '?')}[/]")
+            self._relay_active = False
+            return
+
+        cap_data = r.get("data", {})
+        capture_id = cap_data.get("id", "")
+        self._relay_capture_id = capture_id
+        self.call_from_thread(self._log_relay,
+            f"[green]✓ MCP 捕获已启动 (ID: {capture_id})[/]")
+
+        # 2) 实时轮询 — 定期 dissect 新包
         counter = 0
+        last_packet_count = 0
+        poll_interval = 1.0  # 每 1 秒 dissect 一次
 
         while getattr(self, "_relay_active", False):
-            time.sleep(0.5 + _rng.random() * 1.5)
+            time.sleep(poll_interval)
             if not getattr(self, "_relay_active", False):
                 break
 
-            counter += 1
-            ptype, req = _rng.choice(packet_types)
-            direction = _rng.choice(directions)
-            dev_addr = _rng.randint(1, 7)
-            ep = _rng.choice([0, 0, 0, 1, 2, _rng.randint(1, 15)])
-            data_len = _rng.randint(8, 64)
+            # 检查捕获状态
+            st = bridge.capture_status()
+            if not st.get("ok"):
+                break
 
-            policy = getattr(self, "_relay_policy", "pass")
-            should_hold = False
-            if policy == "hold":
-                should_hold = True
-            elif policy == "setup" and ptype == "SETUP":
-                should_hold = True
-            elif policy == "data" and ptype.startswith("DATA"):
-                should_hold = True
-            elif policy == "all":
-                should_hold = True
+            # 获取最新数据包
+            r = bridge.dissect_packets(capture_id, limit=200)
+            if not r.get("ok"):
+                continue
 
-            pkt = {
-                "num": counter, "dir": direction, "type": ptype,
-                "dev": str(dev_addr), "ep": str(ep), "req": req,
-                "len": data_len, "status": "HELD" if should_hold else "FORWARDED",
-                "data": bytes(_rng.randint(0, 255) for _ in range(data_len)),
-            }
+            data = r.get("data", {})
+            pkts = data.get("packets", [])
 
-            status_icon = "⏸ 拦截" if should_hold else "→ 通过"
+            # 只处理新增的包
+            new_pkts = pkts[last_packet_count:]
+            last_packet_count = len(pkts)
 
-            def _add_row():
+            for p in new_pkts:
+                counter += 1
+                pid_name = p.get("pid_name", "?")
+                dev = str(p.get("device", 0))
+                ep = str(p.get("endpoint", 0))
+                src = p.get("src", "")
+                dst = p.get("dst", "")
+                direction = "OUT→" if "host" in src.lower() else "←IN"
+                extra = p.get("extra", {})
+                # 提取数据长度
+                data_len = 0
+                pkt_data = b""
+                for k, v in extra.items():
+                    if isinstance(v, str) and all(c in "0123456789abcdef:" for c in v.lower()):
+                        try:
+                            pkt_data = bytes.fromhex(v.replace(":", ""))
+                            data_len = len(pkt_data)
+                            break
+                        except ValueError:
+                            pass
+
+                # 请求类型 (SETUP 请求码)
+                req_str = ""
+                if pid_name == "SETUP" and pkt_data:
+                    req_str = f"0x{pkt_data[1]:02x}" if len(pkt_data) > 1 else "-"
+
+                policy = getattr(self, "_relay_policy", "pass")
+                should_hold = False
+                if policy == "hold":
+                    should_hold = True
+                elif policy == "setup" and pid_name == "SETUP":
+                    should_hold = True
+                elif policy == "data" and pid_name in ("DATA0", "DATA1", "DATA2"):
+                    should_hold = True
+                elif policy == "all":
+                    should_hold = True
+
+                pkt = {
+                    "num": counter, "dir": direction, "type": pid_name,
+                    "dev": dev, "ep": ep, "req": req_str,
+                    "len": data_len, "status": "HELD" if should_hold else "FORWARDED",
+                    "data": pkt_data,
+                }
+
+                status_icon = "⏸ 拦截" if should_hold else "→ 通过"
+                pkt_copy = pkt.copy()
+
+                def _add_row(p=pkt_copy, si=status_icon):
+                    try:
+                        table = self.query_one("#relay-queue-table", DataTable)
+                        table.add_row(str(p["num"]), p["dir"], p["type"],
+                                      p["dev"], p["ep"], p["req"],
+                                      str(p["len"]), si,
+                                      key=str(p["num"]))
+                    except:
+                        pass
+
                 try:
-                    table = self.query_one("#relay-queue-table", DataTable)
-                    table.add_row(str(pkt["num"]), pkt["dir"], pkt["type"],
-                                  pkt["dev"], pkt["ep"], pkt["req"],
-                                  str(pkt["len"]), status_icon,
-                                  key=str(pkt["num"]))
+                    self.call_from_thread(_add_row)
                 except:
                     pass
 
-            try:
-                self.call_from_thread(_add_row)
-            except:
-                pass
+                if should_hold:
+                    self._relay_queue.append(pkt)
+                    self.stats.relay_hold += 1
+                    self.call_from_thread(self._log_relay,
+                        f"[yellow]⏸ #{counter} {direction} {pid_name} dev={dev} ep={ep} 已拦截[/]")
+                else:
+                    self.stats.relay_forward += 1
 
-            if should_hold:
-                self._relay_queue.append(pkt)
-                self.stats.relay_hold += 1
-                self.call_from_thread(self._log_relay,
-                    f"[yellow]⏸ #{counter} {direction} {ptype} dev={dev_addr} ep={ep} 已拦截[/]")
-            else:
-                self.stats.relay_forward += 1
+                self.call_from_thread(self._update_relay_stats)
 
-            self.call_from_thread(self._update_relay_stats)
+                # 队列限制
+                if len(self._relay_queue) > 200:
+                    self._relay_queue = self._relay_queue[-100:]
 
-            # 队列限制
-            if len(self._relay_queue) > 200:
-                self._relay_queue = self._relay_queue[-100:]
+        # 3) 捕获结束
+        self.call_from_thread(self._log_relay,
+            f"[dim]中继捕获结束 — 共 {counter} 个真实包[/]")
 
     def _update_relay_stats(self):
         """更新中继统计"""
