@@ -371,6 +371,13 @@ class FuzzPhase(IntEnum):
     HID_REPORT     = 6   # Phase 6: HID 报告描述符 (新增 — 来自 hid-core.c 分析)
     CLASS_SPECIFIC = 7   # Phase 7: 类特定协议 (MSC/CDC/UVC — 来自 storage/net 分析)
     MOBILE_SPECIFIC = 8  # Phase 8: 移动设备协议 (RNDIS/AOA/MTP — 嵌入式设备常见)
+    # ── 深度协议模糊 (v2 扩展 — 基于 syzkaller/raw-gadget/USBFuzz 调研) ──
+    HID_DEEP       = 9   # Phase 9:  HID 语义深度 (multi-touch/ff/raw 底层 — hid-input.c)
+    MSC_DEEP       = 10  # Phase 10: SCSI/BOT/UAS 深度 (CBW 状态机/UAS 协议 — transport.c)
+    CDC_DEEP       = 11  # Phase 11: CDC-ACM/ECM 深度 (line coding/notify/cdc_ether — cdc-acm.c)
+    UVC_DEEP       = 12  # Phase 12: UVC 视频深度 (streaming/format/frame — uvc_driver.c)
+    AUDIO_DEEP     = 13  # Phase 13: UAC 音频深度 (v1/v2/v3 format/mixer — format.c/audio.c)
+    RNDIS_DEEP     = 14  # Phase 14: RNDIS/网络深度 (INIT/OID/keepalive — rndis_host.c)
 
 
 PHASE_NAMES = {
@@ -382,6 +389,12 @@ PHASE_NAMES = {
     FuzzPhase.HID_REPORT:     "HID 报告描述符",
     FuzzPhase.CLASS_SPECIFIC: "类特定协议",
     FuzzPhase.MOBILE_SPECIFIC: "移动设备协议",
+    FuzzPhase.HID_DEEP:       "HID 语义深度",
+    FuzzPhase.MSC_DEEP:       "MSC/SCSI 深度",
+    FuzzPhase.CDC_DEEP:       "CDC/串口深度",
+    FuzzPhase.UVC_DEEP:       "UVC 视频深度",
+    FuzzPhase.AUDIO_DEEP:     "UAC 音频深度",
+    FuzzPhase.RNDIS_DEEP:     "RNDIS/网络深度",
 }
 
 # 源码分析来源说明
@@ -394,6 +407,12 @@ PHASE_SOURCES = {
     FuzzPhase.HID_REPORT:     "drivers/hid/hid-core.c → hid_parse_report(), hid_open_report()",
     FuzzPhase.CLASS_SPECIFIC: "drivers/usb/storage/transport.c, drivers/net/usb/*.c",
     FuzzPhase.MOBILE_SPECIFIC:   "Android UsbHostManager.java, drivers/usb/gadget, AOA 协议",
+    FuzzPhase.HID_DEEP:       "drivers/hid/hid-input.c, hidraw.c, hid-multitouch.c → 语义级报告变异",
+    FuzzPhase.MSC_DEEP:       "drivers/usb/storage/transport.c → US_BULK_CB_SIGN/CBLUN, scsiglue.c → max_lun",
+    FuzzPhase.CDC_DEEP:       "drivers/usb/class/cdc-acm.c → SET_LINE_CODING/SEND_BREAK, cdc_ether.c",
+    FuzzPhase.UVC_DEEP:       "drivers/media/usb/uvc/uvc_driver.c → uvc_parse_format(), bmaControls",
+    FuzzPhase.AUDIO_DEEP:     "sound/usb/format.c → parse_audio_format_i_type(), sound/usb/audio.c",
+    FuzzPhase.RNDIS_DEEP:     "drivers/net/usb/rndis_host.c → rndis_command(), msg_type/request_id 状态机",
 }
 
 
@@ -1148,7 +1167,670 @@ class StrategyGenerator:
 
         return cases[:max_cases]
 
-    # ═══════════════════════════════════════════════════════ 重试耗尽 ════
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 9: HID 语义深度 — drivers/hid/hid-input.c, hid-multitouch.c, hidraw.c
+    # 攻击面: 触摸屏报告解析 / 力反馈报告 / hidraw ioctl / 多触点计数溢出
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def gen_hid_deep_cases(self, max_cases: int = 30) -> list[FuzzCase]:
+        cases = []
+        base_dev = self._base_device_desc()
+        base_cfg = self._base_config_desc()
+        ep1 = 0x81
+
+        # 9.1 多点触屏 (MT) Contact Count 溢出 — hid-multitouch.c
+        # 触屏驱动信任报告中的 ContactCount 字段
+        mt_report = bytes([
+            0x05, 0x0D,       # Usage Page (Digitizers)
+            0x09, 0x04,       # Usage (Touchscreen)
+            0xA1, 0x01,       # Collection (Application)
+            0x09, 0x22,       #   Usage (Finger)
+            0xA1, 0x00,       #   Collection (Physical)
+            0x09, 0x42,       #     Usage (Tip Switch)
+            0x15, 0x00,       #     Logical Min (0)
+            0x25, 0x01,       #     Logical Max (1)
+            0x75, 0x01,       #     Report Size (1)
+            0x95, 0x01,       #     Report Count (1)
+            0x81, 0x02,       #     Input (Data,Var)
+            0x09, 0x32,       #     Usage (In Range)
+            0x81, 0x02,       #     Input (Data,Var)
+            0x95, 0x06,       #     Report Count (6) - padding
+            0x81, 0x03,       #     Input (Const)
+            0x05, 0x01,       #     Usage Page (Generic Desktop)
+            0x09, 0x30,       #     Usage (X)
+            0x09, 0x31,       #     Usage (Y)
+            0x15, 0x00,       #     Logical Min (0)
+            0x26, 0xFF, 0x7F, #     Logical Max (32767)
+            0x75, 0x10,       #     Report Size (16)
+            0x95, 0x02,       #     Report Count (2)
+            0x81, 0x02,       #     Input (Data,Var)
+            0xC0,             #   End Collection
+            0x05, 0x0D,       #   Usage Page (Digitizers)
+            0x09, 0x54,       #   Usage (Contact Count)
+            0x25, 0x0A,       #   Logical Max (10)
+            0x75, 0x08,       #   Report Size (8)
+            0x95, 0x01,       #   Report Count (1)
+            0x81, 0x02,       #   Input (Data,Var)
+            0xC0,             # End Collection
+        ])
+        for count_val in [0, 1, 10, 127, 128, 200, 254, 255]:
+            ep_data = bytes([count_val, 0x01, 0x00, 0x80, 0x01, 0x00, 0x80])
+            cases.append(self._new_case(
+                FuzzPhase.HID_DEEP,
+                f"MT 触屏 ContactCount={count_val} — hid-multitouch.c 触点计数解析",
+                device_descriptor=base_dev,
+                config_descriptor=base_cfg,
+                hid_report_descriptor=mt_report,
+                ep_data_override={ep1: ep_data},
+                source_ref="drivers/hid/hid-multitouch.c → mt_touch_report()",
+                tags=["hid", "multitouch", "contact_count"],
+            ))
+
+        # 9.2 力反馈 (FF) 报告注入 — hid-input.c effect processing
+        ff_report = bytes([
+            0x05, 0x0F,       # Usage Page (Physical Interface Device)
+            0x09, 0x21,       # Usage (PID)
+            0xA1, 0x01,       # Collection (Application)
+            0x85, 0x01,       #   Report ID (1)
+            0x09, 0x97,       #   Usage (DC Enable Actuators)
+            0xA1, 0x02,       #   Collection (Logical)
+            0x0B, 0x01, 0x00, 0x0F, 0x00, # Usage (Actuator)
+            0x15, 0x00,       #     Logical Min (0)
+            0x26, 0xFF, 0x00, #     Logical Max (255)
+            0x75, 0x08,       #     Report Size (8)
+            0x95, 0x01,       #     Report Count (1)
+            0x91, 0x02,       #     Output (Data,Var)
+            0xC0,             #   End Collection
+            0xC0,             # End Collection
+        ])
+        for ff_data in [b'\x01\x00', b'\xFF\xFF', b'\x00\x80', b'\xDE\xAD']:
+            cases.append(self._new_case(
+                FuzzPhase.HID_DEEP,
+                f"力反馈 (FF) 输出报告 data={ff_data.hex()} — PID 效果处理",
+                device_descriptor=base_dev,
+                config_descriptor=base_cfg,
+                hid_report_descriptor=ff_report,
+                ep_data_override={ep1: ff_data},
+                source_ref="drivers/hid/hid-input.c → hidinput_input_event()",
+                tags=["hid", "force_feedback", "pid"],
+            ))
+
+        # 9.3 GET_REPORT / SET_REPORT 控制请求 — hidraw.c
+        # SET_REPORT (wValue=0x0201, report ID=1) 向设备发送数据
+        for report_id in [0, 1, 0x7F, 0xFF]:
+            cases.append(self._new_case(
+                FuzzPhase.HID_DEEP,
+                f"SET_REPORT type=Output reportID={report_id} — hidraw.c report路径",
+                device_descriptor=base_dev,
+                config_descriptor=base_cfg,
+                hid_report_descriptor=mt_report,
+                stall_ep0=False,
+                source_ref="drivers/hid/hidraw.c → hidraw_write()",
+                tags=["hid", "set_report", "hidraw"],
+            ))
+
+        # 9.4 报告描述符 vs 实际报告尺寸不匹配
+        # 声明 Report Size=32 Count=16 但只发 1 字节 — hid-core.c: hid_input_report
+        mismatch_desc = bytes([
+            0x05, 0x01, 0x09, 0x06, 0xA1, 0x01,
+            0x15, 0x00, 0x26, 0xFF, 0xFF,
+            0x75, 0x20,  # Report Size 32
+            0x95, 0x10,  # Report Count 16  → 声明 64 字节
+            0x81, 0x02,
+            0xC0,
+        ])
+        cases.append(self._new_case(
+            FuzzPhase.HID_DEEP,
+            "报告尺寸不匹配: 声明 64 字节但只发 1 字节 — hid_input_report() 缓冲区读取",
+            device_descriptor=base_dev,
+            config_descriptor=base_cfg,
+            hid_report_descriptor=mismatch_desc,
+            ep_data_override={ep1: b'\x41'},
+            source_ref="drivers/hid/hid-core.c → hid_input_report() → hid_report_raw_event()",
+            tags=["hid", "size_mismatch", "oob_read"],
+        ))
+
+        # 9.5 极长报告 (HID_MAX_BUFFER_SIZE 65536)
+        for buf_size in [4096, 8192, 32767, 65535]:
+            cases.append(self._new_case(
+                FuzzPhase.HID_DEEP,
+                f"超大 HID 报告 ({buf_size} 字节) — hid_input_report buffer={HID_LIMITS['HID_MAX_BUFFER_SIZE']}",
+                device_descriptor=base_dev,
+                config_descriptor=base_cfg,
+                hid_report_descriptor=mt_report,
+                ep_data_override={ep1: bytes(buf_size)},
+                source_ref=f"drivers/hid/hid-core.c → hid_input_report() bufsize={HID_LIMITS['HID_MAX_BUFFER_SIZE']}",
+                tags=["hid", "oversized_report", "buffer_overflow"],
+            ))
+
+        return cases[:max_cases]
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 10: MSC/SCSI 深度 — drivers/usb/storage/transport.c, scsiglue.c
+    # 攻击面: CBW 状态机 / SCSI 命令注入 / max_lun / UAS 协议
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def gen_msc_deep_cases(self, max_cases: int = 30) -> list[FuzzCase]:
+        cases = []
+        base_dev = self._base_device_desc()
+        # MSC 配置描述符
+        msc_dev = bytearray(base_dev)
+        msc_dev[4] = 0x08  # Mass Storage
+        msc_dev = bytes(msc_dev)
+
+        # --- CBW (Command Block Wrapper) 结构 ---
+        # offset  size  field
+        # 0       4     Signature (0x43425355 = "USBC")
+        # 4       4     Tag
+        # 8       4     Data Transfer Length
+        # 12      1     Flags (0x80=IN, 0x00=OUT)
+        # 13      1     LUN
+        # 14      1     CDB Length
+        # 15-31   16    CDB (SCSI Command Descriptor Block)
+
+        def make_cbw(sig=b'USBC', tag=1, xfer_len=0, flags=0x80, lun=0,
+                     cdb_len=6, cdb=b'\x00\x00\x00\x00\x00\x00'):
+            cdb_padded = (cdb + b'\x00' * 16)[:16]
+            return sig + struct.pack('<I', tag) + struct.pack('<I', xfer_len) + \
+                   bytes([flags, lun, cdb_len]) + cdb_padded
+
+        # 10.1 畸形 CBW 签名 — transport.c line 1202: 检查 US_BULK_CS_SIGN
+        for bad_sig in [b'\x00\x00\x00\x00', b'\xFF\xFF\xFF\xFF', b'USBX',
+                        b'\x55\x53\x42\x43', b'CSBU', b'\xDE\xAD\xBE\xEF']:
+            cbw = make_cbw(sig=bad_sig)
+            cases.append(self._new_case(
+                FuzzPhase.MSC_DEEP,
+                f"畸形 CBW 签名={bad_sig.hex()} — transport.c signature 验证旁路",
+                device_descriptor=msc_dev,
+                config_descriptor=TPL_MSC_CONFIG,
+                ep_data_override={0x02: cbw},  # OUT endpoint
+                source_ref="drivers/usb/storage/transport.c:1202 → US_BULK_CB_SIGN check",
+                tags=["msc", "cbw", "signature"],
+            ))
+
+        # 10.2 CDB 长度越界 — transport.c 信任 bCDBLength
+        for cdb_len in [0, 1, 5, 6, 10, 12, 16, 127, 200, 255]:
+            cbw = make_cbw(cdb_len=cdb_len, cdb=b'\x12\x00\x00\x00\x24\x00' + b'\xAA' * 10)
+            cases.append(self._new_case(
+                FuzzPhase.MSC_DEEP,
+                f"CDB 长度={cdb_len} 越界 — scsiglue.c queuecommand 信任 bCDBLength",
+                device_descriptor=msc_dev,
+                config_descriptor=TPL_MSC_CONFIG,
+                ep_data_override={0x02: cbw},
+                source_ref="drivers/usb/storage/scsiglue.c → queuecommand()",
+                tags=["msc", "cdb_length", "oob"],
+            ))
+
+        # 10.3 LUN 越界 — scsiglue.c max_lun 检查
+        for lun in [0, 1, 5, 15, 127, 255]:
+            cbw = make_cbw(lun=lun, cdb=b'\x12\x00\x00\x00\x24\x00')
+            cases.append(self._new_case(
+                FuzzPhase.MSC_DEEP,
+                f"LUN={lun} 越界 — scsiglue.c slave_configure max_lun 对比",
+                device_descriptor=msc_dev,
+                config_descriptor=TPL_MSC_CONFIG,
+                ep_data_override={0x02: cbw},
+                source_ref="drivers/usb/storage/scsiglue.c:79 → max_lun > 0 → BLIST_FORCELUN",
+                tags=["msc", "lun", "oob"],
+            ))
+
+        # 10.4 SCSI 命令注入 — 典型危险命令
+        scsi_cmds = {
+            "INQUIRY(0x12)":     b'\x12\x00\x00\x00\xFF\x00',
+            "READ_CAPACITY":     b'\x25\x00\x00\x00\x00\x00\x00\x00\x00\x00',
+            "READ_6":            b'\x08\x00\x00\x00\x01\x00',
+            "READ_10":           b'\x28\x00\x00\x00\x00\x00\x00\x01\x00\x00',
+            "READ_16":           b'\x88\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00',
+            "WRITE_6":           b'\x0A\x00\x00\x00\x01\x00',
+            "WRITE_10":          b'\x2A\x00\x00\x00\x00\x00\x00\x01\x00\x00',
+            "WRITE_16":          b'\x8A\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00',
+            "MODE_SENSE_6":      b'\x1A\x00\x3F\x00\xFF\x00',
+            "MODE_SENSE_10":     b'\x5A\x00\x3F\x00\x00\x00\x00\x00\xFF\x00',
+            "REPORT_LUNS":       b'\xA0\x00\x00\x00\x00\x00\x00\x00\xFF\x00\x00\x00',
+            "REQUEST_SENSE":     b'\x03\x00\x00\x00\xFF\x00',
+            "TEST_UNIT_READY":   b'\x00\x00\x00\x00\x00\x00',
+            "PREVENT_ALLOW":     b'\x1E\x00\x00\x00\x01\x00',
+            "VERIFY(0x2F)":      b'\x2F\x00\x00\x00\x00\x00\x00\x01\x00\x00',
+            "FORMAT_UNIT":       b'\x04\x00\x00\x00\x00\x00',
+            "START_STOP":        b'\x1B\x00\x00\x00\x02\x00',
+            "SEND_DIAGNOSTIC":   b'\x1D\x00\x00\x00\x00\x00',
+        }
+        for name, cmd in scsi_cmds.items():
+            xfer_len = 0xFF if "READ" in name or "INQUIRY" in name or "SENSE" in name or "CAPACITY" in name else 0
+            flags = 0x80 if xfer_len > 0 else 0x00
+            cbw = make_cbw(xfer_len=xfer_len, flags=flags, cdb_len=len(cmd), cdb=cmd)
+            cases.append(self._new_case(
+                FuzzPhase.MSC_DEEP,
+                f"SCSI {name} — xfer_len={xfer_len}",
+                device_descriptor=msc_dev,
+                config_descriptor=TPL_MSC_CONFIG,
+                ep_data_override={0x02: cbw},
+                source_ref="drivers/usb/storage/scsiglue.c → queuecommand() → scsi_dispatch_cmd()",
+                tags=["msc", "scsi", name.lower().split("(")[0]],
+            ))
+
+        # 10.5 超大 DataTransferLength — 触发 kmalloc 大缓冲区
+        for xfer in [0, 1, 512, 4096, 65535, 0x100000, 0xFFFFFFFF]:
+            cbw = make_cbw(xfer_len=xfer, cdb=b'\x28\x00\x00\x00\x00\x00\x00\x01\x00\x00')
+            cases.append(self._new_case(
+                FuzzPhase.MSC_DEEP,
+                f"超大 dCBWDataTransferLength=0x{xfer:X} — kmalloc/sg 分配",
+                device_descriptor=msc_dev,
+                config_descriptor=TPL_MSC_CONFIG,
+                ep_data_override={0x02: cbw},
+                source_ref="drivers/usb/storage/transport.c → usb_stor_Bulk_transport()",
+                tags=["msc", "huge_xfer", "oom"],
+            ))
+
+        return cases[:max_cases]
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 11: CDC-ACM/ECM 深度 — drivers/usb/class/cdc-acm.c, cdc_ether.c
+    # 攻击面: line coding / serial state notification / ECM/RNDIS 网络包
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def gen_cdc_deep_cases(self, max_cases: int = 30) -> list[FuzzCase]:
+        cases = []
+        base_dev = self._base_device_desc()
+        cdc_dev = bytearray(base_dev)
+        cdc_dev[4] = 0x02  # CDC
+        cdc_dev = bytes(cdc_dev)
+
+        ep1_in = 0x81  # Interrupt IN (notifications)
+
+        # 11.1 SET_LINE_CODING 畸形参数 — cdc-acm.c:147 acm_set_line
+        # Line Coding Structure: 7 bytes
+        #   dwDTERate (4) | bCharFormat (1) | bParityType (1) | bDataBits (1)
+        for baud in [0, 300, 9600, 115200, 0x7FFFFFFF, 0xFFFFFFFF]:
+            for databits in [5, 7, 8, 0, 16, 255]:
+                line_coding = struct.pack('<I', baud) + bytes([0x00, 0x00, databits])
+                cases.append(self._new_case(
+                    FuzzPhase.CDC_DEEP,
+                    f"SET_LINE_CODING baud={baud} databits={databits} — acm_set_line() 解析",
+                    device_descriptor=cdc_dev,
+                    config_descriptor=self._base_config_desc(),
+                    ep_data_override={ep1_in: line_coding},
+                    source_ref="drivers/usb/class/cdc-acm.c:147 → acm_ctrl_msg(SET_LINE_CODING)",
+                    tags=["cdc", "line_coding"],
+                ))
+                if len(cases) >= max_cases // 2:
+                    break
+            if len(cases) >= max_cases // 2:
+                break
+
+        # 11.2 SEND_BREAK 变异 — cdc-acm.c:149
+        for break_ms in [0, 1, 100, 0xFFFF, 0x7FFF]:
+            cases.append(self._new_case(
+                FuzzPhase.CDC_DEEP,
+                f"SEND_BREAK duration={break_ms}ms — acm_ctrl_msg(SEND_BREAK)",
+                device_descriptor=cdc_dev,
+                config_descriptor=self._base_config_desc(),
+                stall_ep0=False,
+                source_ref="drivers/usb/class/cdc-acm.c:149 → acm_ctrl_msg(SEND_BREAK)",
+                tags=["cdc", "break"],
+            ))
+
+        # 11.3 Serial State Notification 畸形 — interrupt endpoint
+        # cdc-acm.c: acm_ctrl_irq() parses notification on interrupt EP
+        # Notification header: bmRequestType(1) | bNotification(1) | wValue(2) | wIndex(2) | wLength(2)
+        for notif_data in [
+            b'\xA1\x20\x00\x00\x00\x00\x02\x00\x00\x00',      # SERIAL_STATE, normal
+            b'\xA1\x20\x00\x00\x00\x00\xFF\x00' + b'\xFF' * 255, # 超长 payload
+            b'\xA1\x20\x00\x00\x00\x00\x00\x00',                # 空 payload
+            b'\xA1\x20\x00\x00\x00\x00\xFF\xFF' + b'\x41' * 65535,  # 巨型 notification
+            b'\xA1\x2A\x00\x00\x00\x00\x02\x00\x00\x00',       # 未知 notification type
+            b'\xA1\x20\x00\x00\x00\x00\x02\x00\xFF\xFF',      # 所有状态位置1
+        ]:
+            cases.append(self._new_case(
+                FuzzPhase.CDC_DEEP,
+                f"CDC Notification data[{len(notif_data)}] — acm_ctrl_irq() 解析",
+                device_descriptor=cdc_dev,
+                config_descriptor=self._base_config_desc(),
+                ep_data_override={ep1_in: notif_data},
+                source_ref="drivers/usb/class/cdc-acm.c → acm_ctrl_irq() → notification parsing",
+                tags=["cdc", "notification", "acm_ctrl_irq"],
+            ))
+
+        # 11.4 CDC-ECM 网络包注入 — cdc_ether.c
+        # 在 bulk endpoint 注入畸形以太网帧
+        for frame in [
+            b'\x00' * 14 + b'\x08\x00' + b'\x45' * 20,  # 最小 IP 帧
+            b'\xFF' * 6 + b'\x00' * 6 + b'\x08\x06' + b'\x00' * 100,  # ARP
+            b'\xDE\xAD' * 750,  # 超大帧 (1500 字节)
+            b'\x00' * 1519,     # 巨型帧
+        ]:
+            cases.append(self._new_case(
+                FuzzPhase.CDC_DEEP,
+                f"CDC-ECM 畸形以太网帧 [{len(frame)} 字节] — rx_fixup() 解析",
+                device_descriptor=cdc_dev,
+                config_descriptor=self._base_config_desc(),
+                ep_data_override={0x82: frame},
+                source_ref="drivers/net/usb/cdc_ether.c → usbnet_rx() / rx_fixup()",
+                tags=["cdc", "ecm", "ethernet", "frame"],
+            ))
+
+        return cases[:max_cases]
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 12: UVC 视频深度 — drivers/media/usb/uvc/uvc_driver.c
+    # 攻击面: 流式格式解析 / bmaControls / frame descriptor / probe/commit
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def gen_uvc_deep_cases(self, max_cases: int = 30) -> list[FuzzCase]:
+        cases = []
+        base_dev = self._base_device_desc()
+        uvc_dev = bytearray(base_dev)
+        uvc_dev[4] = 0x0E  # Video
+        uvc_dev = bytes(uvc_dev)
+
+        # UVC 配置描述符模板 (Video Streaming interface)
+        uvc_config = bytes([
+            # Config
+            0x09, 0x02, 0x52, 0x00, 0x02, 0x01, 0x00, 0x80, 0xFA,
+            # IAD
+            0x08, 0x0B, 0x00, 0x02, 0x0E, 0x03, 0x00, 0x00,
+            # Video Control Interface
+            0x09, 0x04, 0x00, 0x00, 0x00, 0x0E, 0x01, 0x01, 0x00,
+            # VC Header descriptor
+            0x0D, 0x24, 0x01, 0x40, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01,
+            # Video Streaming Interface
+            0x09, 0x04, 0x01, 0x00, 0x01, 0x0E, 0x02, 0x00, 0x00,
+            # VS Header — nformats=1
+            0x0E, 0x24, 0x01, 0x01, 0x0F, 0x00, 0x82, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            # VS Format descriptor — bNumFrameDescriptors
+            0x0B, 0x24, 0x04, 0x01, 0x01, 0x59, 0x55, 0x59, 0x56, 0x00, 0x00,
+            # VS Frame descriptor — wWidth/wHeight
+            0x1E, 0x24, 0x05, 0x01, 0x80, 0x02, 0xE0, 0x01,
+            0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x1C, 0x00,
+            0x00, 0x00, 0x00, 0x90, 0x53, 0x00, 0x00, 0x00,
+            0x90, 0x53, 0x00, 0x00, 0x00, 0x00,
+            # Endpoint (Bulk IN)
+            0x07, 0x05, 0x82, 0x02, 0x00, 0x02, 0x00,
+        ])
+
+        # 12.1 bNumFrameDescriptors 不匹配
+        for nframes in [0, 1, 5, 16, 127, 255]:
+            cfg = bytearray(uvc_config)
+            cfg[0x3F] = nframes  # bNumFrameDescriptors
+            cases.append(self._new_case(
+                FuzzPhase.UVC_DEEP,
+                f"UVC bNumFrameDescriptors={nframes} — uvc_parse_format() 循环计数",
+                device_descriptor=uvc_dev,
+                config_descriptor=bytes(cfg),
+                source_ref="drivers/media/usb/uvc/uvc_driver.c:335 → uvc_parse_format()",
+                tags=["uvc", "frame_count"],
+            ))
+
+        # 12.2 wWidth/wHeight 边界值
+        for dims in [(0, 0), (1, 1), (32768, 32768), (65535, 65535), (0xFFFF, 0x0001)]:
+            cfg = bytearray(uvc_config)
+            struct.pack_into('<HH', cfg, 0x42, dims[0], dims[1])
+            cases.append(self._new_case(
+                FuzzPhase.UVC_DEEP,
+                f"UVC 分辨率 {dims[0]}x{dims[1]} — frame descriptor 解析",
+                device_descriptor=uvc_dev,
+                config_descriptor=bytes(cfg),
+                source_ref="drivers/media/usb/uvc/uvc_driver.c:541 → nframes/nintervals allocation",
+                tags=["uvc", "resolution"],
+            ))
+
+        # 12.3 bmaControls 超大 — uvc_driver.c:647 kmemdup
+        for p_val in [0, 1, 4, 32, 127, 255]:
+            cfg = bytearray(uvc_config)
+            # VS Header 的 p 字段控制 bmaControls bitmap 大小
+            cfg[0x33] = p_val  # p = bControlSize
+            cases.append(self._new_case(
+                FuzzPhase.UVC_DEEP,
+                f"UVC bmaControls size={p_val} — uvc_driver.c:647 kmemdup(&buffer[size], p*n)",
+                device_descriptor=uvc_dev,
+                config_descriptor=bytes(cfg),
+                source_ref="drivers/media/usb/uvc/uvc_driver.c:647 → kmemdup() OOB",
+                tags=["uvc", "bmaControls", "oob"],
+            ))
+
+        # 12.4 PROBE_CONTROL / COMMIT_CONTROL 请求 — uvc_v4l2.c
+        for ctrl_val in [0x01, 0x02, 0xFF]:
+            probe_data = struct.pack('<I', ctrl_val) + b'\x00' * 22  # 26-byte probe data
+            cases.append(self._new_case(
+                FuzzPhase.UVC_DEEP,
+                f"UVC PROBE/COMMIT control=0x{ctrl_val:02X} — uvc_v4l2.c 流式协商",
+                device_descriptor=uvc_dev,
+                config_descriptor=uvc_config,
+                ep_data_override={0x82: probe_data},
+                source_ref="drivers/media/usb/uvc/uvc_v4l2.c → uvc_v4l2_ioctl()",
+                tags=["uvc", "probe", "commit"],
+            ))
+
+        # 12.5 nformats=0 → 后续格式遍历 OOM
+        cfg = bytearray(uvc_config)
+        cfg[0x36] = 0  # nformats=0 in VS header
+        cases.append(self._new_case(
+            FuzzPhase.UVC_DEEP,
+            "UVC nformats=0 — uvc_driver.c:705 检查 nformats==0 但后续遍历",
+            device_descriptor=uvc_dev,
+            config_descriptor=bytes(cfg),
+            source_ref="drivers/media/usb/uvc/uvc_driver.c:705 → if (nformats == 0)",
+            tags=["uvc", "nformats_zero"],
+        ))
+
+        return cases[:max_cases]
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 13: UAC 音频深度 — sound/usb/format.c, sound/usb/audio.c
+    # 攻击面: format type I/II/III / sample rate / bit resolution / mixer
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def gen_audio_deep_cases(self, max_cases: int = 30) -> list[FuzzCase]:
+        cases = []
+        base_dev = self._base_device_desc()
+        audio_dev = bytearray(base_dev)
+        audio_dev[4] = 0x01  # Audio (legacy)
+        audio_dev = bytes(audio_dev)
+
+        # UAC v1 Audio Streaming descriptor 模板
+        uac_config = bytes([
+            # Config
+            0x09, 0x02, 0x42, 0x00, 0x02, 0x01, 0x00, 0x80, 0x32,
+            # AC Interface
+            0x09, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+            # AC Header
+            0x0A, 0x24, 0x01, 0x00, 0x01, 0x09, 0x00, 0x01, 0x02, 0x00,
+            # AS Interface (alt 1)
+            0x09, 0x04, 0x01, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00,
+            # AS General
+            0x07, 0x24, 0x01, 0x01, 0x01, 0x81, 0x00,
+            # Format Type I descriptor
+            0x0B, 0x24, 0x02, 0x01, 0x01, 0x02, 0x10, 0x80, 0xBB, 0x00, 0x00,
+            # Endpoint (Isochronous IN)
+            0x09, 0x05, 0x81, 0x01, 0x64, 0x00, 0x01, 0x00, 0x00,
+            # Endpoint - Audio Control
+            0x07, 0x25, 0x01, 0x01, 0x00, 0x00, 0x00,
+        ])
+
+        # 13.1 wFormatTag 变异 — format.c:31 parse_audio_format_i_type
+        for fmt_tag in [0x0001, 0x0003, 0x0040, 0xFF00, 0xFFFE, 0xFFFF]:
+            cfg = bytearray(uac_config)
+            struct.pack_into('<H', cfg, 0x37, fmt_tag)  # wFormatTag offset
+            cases.append(self._new_case(
+                FuzzPhase.AUDIO_DEEP,
+                f"UAC wFormatTag=0x{fmt_tag:04X} — parse_audio_format_i_type() 格式解析",
+                device_descriptor=audio_dev,
+                config_descriptor=bytes(cfg),
+                source_ref="sound/usb/format.c:31 → parse_audio_format_i_type()",
+                tags=["audio", "format_tag"],
+            ))
+
+        # 13.2 bSubFrameSize + bBitResolution 组合 — buffer 大小计算
+        for (subframe, bits) in [(0, 0), (1, 8), (2, 16), (3, 24), (4, 32), (255, 255), (0, 255), (255, 0)]:
+            cfg = bytearray(uac_config)
+            cfg[0x38] = subframe  # bSubFrameSize
+            cfg[0x39] = bits      # bBitResolution
+            cases.append(self._new_case(
+                FuzzPhase.AUDIO_DEEP,
+                f"UAC bSubFrameSize={subframe} bBitResolution={bits} — PCM 格式映射",
+                device_descriptor=audio_dev,
+                config_descriptor=bytes(cfg),
+                source_ref="sound/usb/format.c → parse_audio_format_i_type() → pcm_formats mapping",
+                tags=["audio", "subframe", "bits"],
+            ))
+
+        # 13.3 bNrChannels 超大值 — 通道数组溢出
+        for nch in [0, 1, 2, 6, 8, 32, 127, 255]:
+            cfg = bytearray(uac_config)
+            cfg[0x38] = nch  # Override bNrChannels
+            cases.append(self._new_case(
+                FuzzPhase.AUDIO_DEEP,
+                f"UAC bNrChannels={nch} — 通道分配数组 OOB",
+                device_descriptor=audio_dev,
+                config_descriptor=bytes(cfg),
+                source_ref="sound/usb/stream.c → snd_usb_parse_audio_interface()",
+                tags=["audio", "channels", "oob"],
+            ))
+
+        # 13.4 Sample Rate 畸形 — format.c sample rate 解析
+        for rate in [0, 44100, 48000, 192000, 0x7FFFFFFF, 0xFFFFFFFF]:
+            rate_data = struct.pack('<I', rate)  # 24-bit sample rate in UAC v1
+            cases.append(self._new_case(
+                FuzzPhase.AUDIO_DEEP,
+                f"UAC sample rate={rate} Hz — format.c 频率表解析",
+                device_descriptor=audio_dev,
+                config_descriptor=uac_config,
+                ep_data_override={0x81: rate_data},
+                source_ref="sound/usb/format.c → parse_audio_format_rates()",
+                tags=["audio", "sample_rate"],
+            ))
+
+        # 13.5 isochronous endpoint MaxPacketSize 边界 — 整数溢出
+        for mps in [0, 1, 192, 1023, 1024, 3072, 0x7FFF, 0xFFFF]:
+            cfg = bytearray(uac_config)
+            struct.pack_into('<H', cfg, 0x3F, mps)
+            cases.append(self._new_case(
+                FuzzPhase.AUDIO_DEEP,
+                f"UAC Iso EP wMaxPacketSize={mps} — audio.c 传输缓冲区分配",
+                device_descriptor=audio_dev,
+                config_descriptor=bytes(cfg),
+                source_ref="sound/usb/endpoint.c → snd_usb_endpoint_open()",
+                tags=["audio", "maxpacket", "iso"],
+            ))
+
+        return cases[:max_cases]
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Phase 14: RNDIS/网络深度 — drivers/net/usb/rndis_host.c
+    # 攻击面: INIT/INIT_CMPLT 状态机 / OID 查询 / KEEPALIVE / msg_type/request_id
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def gen_rndis_deep_cases(self, max_cases: int = 30) -> list[FuzzCase]:
+        cases = []
+        base_dev = self._base_device_desc()
+        rndis_dev = bytearray(base_dev)
+        rndis_dev[4] = 0xE0  # Wireless Controller (RNDIS uses 0x02/0xEF)
+        rndis_dev = bytes(rndis_dev)
+
+        ep1_in = 0x81  # Interrupt IN (RNDIS notifications)
+
+        # RNDIS 消息结构: msg_type(4) | msg_len(4) | request_id/data(4+) | ...
+        RNDIS_MSG_INIT      = 0x00000002
+        RNDIS_MSG_INIT_C    = 0x80000002
+        RNDIS_MSG_HALT      = 0x00000003
+        RNDIS_MSG_QUERY     = 0x00000004
+        RNDIS_MSG_QUERY_C   = 0x80000004
+        RNDIS_MSG_SET       = 0x00000005
+        RNDIS_MSG_SET_C     = 0x80000005
+        RNDIS_MSG_RESET     = 0x00000006
+        RNDIS_MSG_RESET_C   = 0x80000006
+        RNDIS_MSG_INDICATE  = 0x00000007
+        RNDIS_MSG_KEEPALIVE = 0x00000008
+        RNDIS_MSG_KEEPALIVE_C = 0x80000008
+
+        # 14.1 RNDIS INIT message 变异 — rndis_host.c:95 rndis_command()
+        for (msg_type, msg_len, req_id) in [
+            (RNDIS_MSG_INIT,    24, 1),         # 正常 INIT
+            (RNDIS_MSG_INIT,    0, 1),           # msg_len=0
+            (RNDIS_MSG_INIT,    0xFFFFFFFF, 1),  # msg_len 巨大
+            (RNDIS_MSG_INIT_C,  52, 1),          # 主动发 INIT_CMPLT (反转角色)
+            (RNDIS_MSG_RESET,   12, 1),          # RESET
+            (RNDIS_MSG_HALT,    12, 1),          # HALT
+            (RNDIS_MSG_INDICATE, 8, 1),          # INDICATE
+            (0xDEADBEEF,        24, 1),          # 未知 msg_type
+            (RNDIS_MSG_INIT,    24, 0xFFFFFFFF), # request_id 溢出
+        ]:
+            msg = struct.pack('<III', msg_type, msg_len, req_id)
+            cases.append(self._new_case(
+                FuzzPhase.RNDIS_DEEP,
+                f"RNDIS msg_type=0x{msg_type:08X} len={msg_len} reqID={req_id} — rndis_command() 状态机",
+                device_descriptor=rndis_dev,
+                config_descriptor=self._base_config_desc(),
+                ep_data_override={ep1_in: msg},
+                source_ref="drivers/net/usb/rndis_host.c:106 → msg_type = le32_to_cpu(buf->msg_type)",
+                tags=["rndis", "msg_type", f"type_0x{msg_type:08X}"],
+            ))
+
+        # 14.2 RNDIS OID 查询注入 — rndis_host.c → rndis_query_config()
+        # 关键 OID: GEN_OID_LINK_SPEED, GEN_OID_MAX_TOTAL_SIZE
+        oids = {
+            "GEN_OID_SUPPORTED_LIST":   0x00010101,
+            "GEN_OID_HARDWARE_STATUS":  0x00010102,
+            "GEN_OID_MEDIA_SUPPORT":    0x00010103,
+            "GEN_OID_MAX_TOTAL_SIZE":   0x00010111,
+            "GEN_OID_LINK_SPEED":       0x00010117,
+            "8023_OID_PERMANENT_ADDR":  0x01010101,
+            "8023_OID_CURRENT_ADDR":    0x01010102,
+        }
+        for name, oid in oids.items():
+            oid_query = struct.pack('<IIIIII',
+                RNDIS_MSG_QUERY,   # msg_type
+                28,                 # msg_len
+                1,                  # request_id
+                oid,                # OID
+                20,                 # len
+                0,                  # offset
+            )
+            cases.append(self._new_case(
+                FuzzPhase.RNDIS_DEEP,
+                f"RNDIS OID {name} (0x{oid:08X}) — rndis_oid_query() 响应处理",
+                device_descriptor=rndis_dev,
+                config_descriptor=self._base_config_desc(),
+                ep_data_override={ep1_in: oid_query},
+                source_ref="drivers/net/usb/rndis_host.c → rndis_oid_query()",
+                tags=["rndis", "oid", name.lower()],
+            ))
+
+        # 14.3 RNDIS 响应/请求 ID 不匹配 — rndis_host.c:156
+        for (sent_id, resp_id) in [(1, 2), (1, 1), (0, 0xFFFFFFFF), (0xFF, 0x00)]:
+            # 模拟主机发送 request_id=sent_id, 设备回复 request_id=resp_id
+            resp = struct.pack('<IIII',
+                RNDIS_MSG_KEEPALIVE_C,  # msg_type
+                16,                      # msg_len
+                resp_id,                 # request_id (mismatch!)
+                0,                       # status
+            )
+            cases.append(self._new_case(
+                FuzzPhase.RNDIS_DEEP,
+                f"RNDIS request_id 不匹配: sent={sent_id} resp={resp_id} — 状态检查",
+                device_descriptor=rndis_dev,
+                config_descriptor=self._base_config_desc(),
+                ep_data_override={ep1_in: resp},
+                source_ref="drivers/net/usb/rndis_host.c:156 → request_id == xid check",
+                tags=["rndis", "request_id_mismatch"],
+            ))
+
+        # 14.4 超长 RNDIS 消息
+        for payload_len in [0, 64, 4096, 65535]:
+            msg = struct.pack('<II', RNDIS_MSG_INDICATE, payload_len + 8) + b'\x41' * payload_len
+            cases.append(self._new_case(
+                FuzzPhase.RNDIS_DEEP,
+                f"RNDIS INDICATE 超长消息 payload={payload_len} — rndis_msg_parse() 缓冲区",
+                device_descriptor=rndis_dev,
+                config_descriptor=self._base_config_desc(),
+                ep_data_override={ep1_in: msg},
+                source_ref="drivers/net/usb/rndis_host.c → rndis_command() → msg_len handling",
+                tags=["rndis", "oversized", "indicate"],
+            ))
+
+        return cases[:max_cases]
+
+    # ═══════════════════════════════════════════════════════════════════════
     # 全量生成
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -1163,6 +1845,13 @@ class StrategyGenerator:
             FuzzPhase.HID_REPORT:     self.gen_hid_report_cases,
             FuzzPhase.CLASS_SPECIFIC: self.gen_class_specific_cases,
             FuzzPhase.MOBILE_SPECIFIC:   self.gen_mobile_specific_cases,
+            # 深度协议模糊阶段
+            FuzzPhase.HID_DEEP:       self.gen_hid_deep_cases,
+            FuzzPhase.MSC_DEEP:       self.gen_msc_deep_cases,
+            FuzzPhase.CDC_DEEP:       self.gen_cdc_deep_cases,
+            FuzzPhase.UVC_DEEP:       self.gen_uvc_deep_cases,
+            FuzzPhase.AUDIO_DEEP:     self.gen_audio_deep_cases,
+            FuzzPhase.RNDIS_DEEP:     self.gen_rndis_deep_cases,
         }
         result = {}
         for phase, gen in generators.items():
