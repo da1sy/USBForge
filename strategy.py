@@ -415,6 +415,7 @@ PHASE_SOURCES = {
     FuzzPhase.UVC_DEEP:       "drivers/media/usb/uvc/uvc_driver.c → uvc_parse_format(), bmaControls",
     FuzzPhase.AUDIO_DEEP:     "sound/usb/format.c → parse_audio_format_i_type(), sound/usb/audio.c",
     FuzzPhase.RNDIS_DEEP:     "drivers/net/usb/rndis_host.c → rndis_command(), msg_type/request_id 状态机",
+    FuzzPhase.CVE_REPLAY:     "NVD/syzbot 2015-2025 → 60+ CVE: OOB/UAF/NULL-deref/整数溢出/除零/信息泄露",
 }
 
 
