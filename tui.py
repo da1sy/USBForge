@@ -3164,25 +3164,47 @@ class USBForgeApp(App):
             if self._stop_event.is_set():
                 break
             self._pause_event.wait()
+
+            # 日志：正在执行哪个用例
+            phase_name = PHASE_NAMES.get(case.phase, "?")
+            self.call_from_thread(
+                self._log_fuzz_info,
+                f"[cyan]▶ [{i+1}/{self.stats.fuzz_total}][/] Phase {case.phase.value} {phase_name}: {case.description}"
+            )
+
             result = self._execute_fuzz_case(case)
             self.stats.fuzz_executed += 1
+
+            status_icon = "✓"
+            status_color = "green"
             if result.get("crash"):
+                status_icon = "💥"
+                status_color = "bold red"
                 self.stats.fuzz_crashed += 1
                 self.stats.crashes.append({"case": case, "detail": result.get("detail")})
                 self.call_from_thread(self._on_fuzz_crash, case, result.get("detail"))
             elif result.get("warning"):
+                status_icon = "⚠"
+                status_color = "yellow"
                 self.stats.fuzz_warnings += 1
+            elif result.get("status") == "error":
+                status_icon = "✗"
+                status_color = "dim red"
             else:
                 self.stats.fuzz_passed += 1
+
+            self.call_from_thread(
+                self._log_fuzz_info,
+                f"  [{status_color}]{status_icon}[/] {result.get('status', 'unknown')}"
+            )
 
             if case.phase in self.stats.phase_stats:
                 self.stats.phase_stats[case.phase]["executed"] += 1
                 if result.get("crash"):
                     self.stats.phase_stats[case.phase]["crashed"] += 1
 
-            if i % 3 == 0 or result.get("crash"):
-                self.call_from_thread(self._update_fuzz_stats)
-                self.call_from_thread(self._update_fuzz_phase_table, case.phase)
+            self.call_from_thread(self._update_fuzz_stats)
+            self.call_from_thread(self._update_fuzz_phase_table, case.phase)
 
             time.sleep(delay)
 
@@ -3190,17 +3212,227 @@ class USBForgeApp(App):
         self.call_from_thread(self._on_fuzz_complete)
 
     def _execute_fuzz_case(self, case: FuzzCase) -> dict:
-        time.sleep(0.01)
+        """通过 Facedancer/Cynthion 执行单个模糊测试用例"""
+        import asyncio
+        import struct as _struct
+
+        result = {"crash": False, "warning": False, "detail": None,
+                  "phase": int(case.phase), "case_id": case.case_id,
+                  "description": case.description}
+
+        # ── Phase 1-8: 通过 Facedancer 创建恶意 USB 设备并连接 ──
+        loop = None
+        device = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            from facedancer import USBDevice, USBConfiguration, USBInterface, USBEndpoint
+            from facedancer.core import FacedancerUSBApp
+            from facedancer.types import USBDirection, USBTransferType, DeviceSpeed
+            from facedancer.classes.hid import HIDClassSubclass
+
+            # 解析设备描述符
+            dev_desc = case.device_descriptor
+            vid = 0x1D50
+            pid = 0x6018
+            dev_class = 0
+            dev_sub = 0
+            dev_proto = 0
+            if dev_desc and len(dev_desc) >= 12:
+                vid = _struct.unpack_from('<H', dev_desc, 8)[0]
+                pid = _struct.unpack_from('<H', dev_desc, 10)[0]
+                dev_class = dev_desc[4]
+                dev_sub = dev_desc[5]
+                dev_proto = dev_desc[6]
+
+            # 延迟响应
+            delay_s = (case.delay_response_ms or 0) / 1000.0
+
+            # 解析配置描述符 → 提取接口/端点
+            cfg_desc = case.config_descriptor
+            interfaces_parsed = []
+            if cfg_desc and len(cfg_desc) >= 9:
+                off = 0
+                while off + 4 <= len(cfg_desc):
+                    dlen = cfg_desc[off] if off < len(cfg_desc) else 0
+                    dtype = cfg_desc[off + 1] if off + 1 < len(cfg_desc) else 0
+                    if dlen == 0:
+                        break
+                    if dtype == 0x04 and off + 9 <= len(cfg_desc):  # Interface
+                        iface = {
+                            "number": cfg_desc[off + 2],
+                            "class": cfg_desc[off + 5],
+                            "subclass": cfg_desc[off + 6],
+                            "protocol": cfg_desc[off + 7],
+                            "endpoints": [],
+                        }
+                        interfaces_parsed.append(iface)
+                    elif dtype == 0x05 and off + 7 <= len(cfg_desc):  # Endpoint
+                        ep_addr = cfg_desc[off + 2]
+                        ep_attr = cfg_desc[off + 3]
+                        ep_mps = _struct.unpack_from('<H', cfg_desc, off + 4)[0]
+                        if interfaces_parsed:
+                            interfaces_parsed[-1]["endpoints"].append({
+                                "addr": ep_addr, "attrs": ep_attr, "mps": ep_mps,
+                            })
+                    off += dlen
+
+            # 构建 fuzz device 的 GET_DESCRIPTOR 拦截器
+            stall_ep0 = case.stall_ep0
+            ctrl_response = b'\x00' * 64
+            hid_desc = case.hid_report_descriptor
+
+            from facedancer import standard_request_handler
+            from facedancer.types import USBDescriptorType
+            from facedancer.classes.hid import HIDDescriptor
+
+            class FuzzDevice(USBDevice):
+                vendor_id               = vid
+                product_id              = pid
+                device_revision         = 0x0100
+                manufacturer_string     = "FuzzCorp"
+                product_string          = f"FuzzDevice-{case.case_id}"
+                serial_number_string    = f"FUZZ{case.case_id:08d}"
+                device_class            = dev_class
+                device_subclass         = dev_sub
+                protocol_revision_number = dev_proto
+
+                @standard_request_handler(number=USBDescriptorType.STANDARD_GET_DESCRIPTOR)
+                def handle_get_descriptor(self, request):
+                    """拦截 GET_DESCRIPTOR — 返回变异描述符"""
+                    import time as _time
+                    if delay_s > 0:
+                        _time.sleep(delay_s)
+                    if stall_ep0:
+                        request.stall()
+                        return
+                    desc_type = (request.value >> 8) & 0xFF
+                    if desc_type == 0x01:  # Device
+                        data = dev_desc or bytes(18)
+                        request.reply(data[:request.length or len(data)])
+                    elif desc_type == 0x02:  # Configuration
+                        data = cfg_desc or bytes(9)
+                        request.reply(data[:request.length or len(data)])
+                    elif desc_type == 0x03:  # String
+                        request.reply(b'\x04\x03\x09\x04')
+                    elif desc_type == 0x22 and hid_desc:  # HID Report
+                        request.reply(hid_desc[:request.length or len(hid_desc)])
+                    else:
+                        request.reply(ctrl_response[:request.length or 64])
+
+                @standard_request_handler
+                def handle_all(self, request):
+                    """通用控制请求处理"""
+                    import time as _time
+                    if delay_s > 0:
+                        _time.sleep(delay_s)
+                    if stall_ep0:
+                        request.stall()
+                        return
+                    if request.request in (0x05, 0x09):  # SET_ADDRESS, SET_CONFIGURATION
+                        request.ack()
+                    elif request.request == 0x00:  # GET_STATUS
+                        request.reply(b'\x00\x00')
+                    else:
+                        resp = ctrl_response[:request.length or 0]
+                        if resp:
+                            request.reply(resp)
+                        else:
+                            request.ack()
+
+            device = FuzzDevice()
+
+            # 添加配置和接口
+            class FuzzConfig(USBConfiguration):
+                configuration_string = "Fuzz Config"
+                max_power = 100
+
+            config = FuzzConfig()
+            for iface_info in interfaces_parsed:
+                iface = USBInterface(
+                    number=iface_info["number"],
+                    class_number=iface_info["class"],
+                    subclass_number=iface_info["subclass"],
+                    protocol_number=iface_info["protocol"],
+                )
+                for ep_info in iface_info["endpoints"]:
+                    ep_addr = ep_info["addr"]
+                    ep_attr = ep_info["attrs"]
+                    ep_type_val = (ep_attr >> 0) & 0x03
+                    ep_type_map = {
+                        0: USBTransferType.CONTROL,
+                        1: USBTransferType.ISOCHRONOUS,
+                        2: USBTransferType.BULK,
+                        3: USBTransferType.INTERRUPT,
+                    }
+                    ep = USBEndpoint(
+                        number=ep_addr & 0x0F,
+                        direction=USBDirection.IN if (ep_addr & 0x80) else USBDirection.OUT,
+                        transfer_type=ep_type_map.get(ep_type_val, USBTransferType.INTERRUPT),
+                        max_packet_size=ep_info["mps"],
+                    )
+                    iface.add_endpoint(ep)
+                config.add_interface(iface)
+            device.add_configuration(config)
+
+            # 连接并仿真
+            app = FacedancerUSBApp()
+            device.connect(app)
+
+            # 等待主机枚举（留出时间让目标主机处理恶意设备）
+            enum_wait = max(2.0, delay_s)
+            loop.run_until_complete(asyncio.sleep(enum_wait))
+
+            # Phase 4: 如果有端点数据，通过 EP 发送
+            if case.ep_data_override:
+                for ep_addr, data in case.ep_data_override.items():
+                    try:
+                        device.backend.send_on_endpoint(
+                            endpoint_number=ep_addr & 0x0F,
+                            data=data,
+                            blocking=True,
+                        )
+                    except Exception:
+                        pass
+                # 保持连接让主机处理数据
+                loop.run_until_complete(asyncio.sleep(1.0))
+
+            # Phase 3: 快速重连已通过 delay 控制
+
+            result["status"] = "executed"
+
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+        finally:
+            # 断开设备
+            try:
+                if device:
+                    device.disconnect()
+            except Exception:
+                pass
+            try:
+                if loop:
+                    loop.run_until_complete(asyncio.sleep(0.3))
+                    loop.close()
+            except Exception:
+                pass
+
+        # 检查目标是否崩溃
         if hasattr(self, '_monitor') and self._monitor:
             try:
                 detail = self._monitor.check()
                 if detail.is_crash:
-                    return {"crash": True, "detail": detail}
+                    result["crash"] = True
+                    result["detail"] = detail
                 elif detail.is_anomaly:
-                    return {"warning": True, "detail": detail}
-            except:
+                    result["warning"] = True
+                    result["detail"] = detail
+            except Exception:
                 pass
-        return {"crash": False, "warning": False}
+
+        return result
 
     def _on_fuzz_crash(self, case: FuzzCase, detail):
         crash_msg = Text()
