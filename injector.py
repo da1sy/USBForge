@@ -318,7 +318,18 @@ class PacketInjector:
         self.sent_count = 0
         self.error_count = 0
         self._callbacks: list[Callable] = []
-        self._device = None  # Facedancer device handle
+        self._host = None          # LibUSBHostApp 实例 (host 模式)
+        self._facedancer_dev = None  # Facedancer 设备 (device 模式, 用于 inject_serial)
+        self._connect_host()
+
+    def _connect_host(self):
+        """尝试连接 Cynthion host 后端 (TARGET-A → DUT)"""
+        try:
+            from facedancer.backends.libusbhost import LibUSBHostApp
+            self._host = LibUSBHostApp()
+            self._host.connect()
+        except Exception:
+            self._host = None
 
     def add_callback(self, cb: Callable):
         self._callbacks.append(cb)
@@ -331,7 +342,7 @@ class PacketInjector:
                 pass
 
     def send_single(self, req: ControlRequest) -> dict:
-        """发送单个控制请求"""
+        """发送单个控制请求到 DUT (通过 Cynthion host 后端)"""
         result = {
             "request": req.to_dict(),
             "timestamp": time.time(),
@@ -340,15 +351,37 @@ class PacketInjector:
             "error": "",
         }
 
-        # 尝试通过 Facedancer 发送
         try:
-            # 在实际硬件上，这里会:
-            # 1. 确保 Facedancer 设备已连接
-            # 2. 构造 USBControlRequest
-            # 3. 发送到 DUT
-            # 4. 等待响应
-            self.sent_count += 1
-            result["status"] = "sent (simulated)"
+            if self._host is not None:
+                # 通过 Cynthion LibUSBHost 后端发送真实 USB 控制请求
+                if req.direction == DIR_IN:
+                    # IN 方向 — 主机读取设备数据
+                    data = self._host.control_request_in(
+                        request_type=req.req_type,
+                        recipient=req.recipient,
+                        request=req.bRequest,
+                        value=req.wValue,
+                        index=req.wIndex,
+                        length=req.wLength,
+                    )
+                    result["response_hex"] = bytes(data).hex() if data else ""
+                    result["status"] = "ok"
+                else:
+                    # OUT 方向 — 主机向设备发送数据
+                    self._host.control_request_out(
+                        request_type=req.req_type,
+                        recipient=req.recipient,
+                        request=req.bRequest,
+                        value=req.wValue,
+                        index=req.wIndex,
+                        data=list(req.data) if req.data else [],
+                    )
+                    result["status"] = "ok"
+                self.sent_count += 1
+            else:
+                # 无硬件 — 降级模拟
+                self.sent_count += 1
+                result["status"] = "sent (no hardware)"
         except Exception as e:
             self.error_count += 1
             result["status"] = "error"
@@ -384,27 +417,99 @@ class PacketInjector:
         self._notify({"event": "batch_complete", "sent": self.sent_count, "errors": self.error_count})
 
     def replay_pcap(self, pcap_path: Path) -> dict:
-        """从 pcap 文件重放 USB 流量"""
+        """从 pcap (LINKTYPE_USB_2_0) 文件重放 USB 控制请求"""
         result = {"replayed": 0, "errors": 0}
 
         try:
+            import struct as _struct
             data = pcap_path.read_bytes()
-            # 跳过 pcap global header (24 bytes)
-            offset = 24
-            while offset < len(data) - 16:
-                ts_sec = int.from_bytes(data[offset:offset+4], "little")
-                ts_usec = int.from_bytes(data[offset+4:offset+8], "little")
-                incl_len = int.from_bytes(data[offset+8:offset+12], "little")
-                orig_len = int.from_bytes(data[offset+12:offset+16], "little")
+
+            if len(data) < 24:
+                result["error"] = "pcap 文件过小"
+                self._notify({"event": "replay_complete", **result})
+                return result
+
+            # 解析 pcap global header
+            magic = _struct.unpack_from("<I", data, 0)[0]
+            if magic == 0xA1B2C3D4:
+                endian = "<"
+            elif magic == 0xD4C3B2A1:
+                endian = ">"
+            else:
+                result["error"] = f"非标准 pcap magic: 0x{magic:08x}"
+                self._notify({"event": "replay_complete", **result})
+                return result
+
+            linktype = _struct.unpack_from(f"{endian}I", data, 20)[0]
+            # LINKTYPE_USB_2_0 = 288, LINKTYPE_USB_LINUX = 189
+
+            offset = 24  # 跳过 global header
+            while offset + 16 <= len(data):
+                incl_len = _struct.unpack_from(f"{endian}I", data, offset + 8)[0]
                 offset += 16
+
+                if offset + incl_len > len(data):
+                    break
 
                 pkt_data = data[offset:offset + incl_len]
                 offset += incl_len
 
-                # 简单解析 USB SETUP
-                if len(pkt_data) >= 9 and pkt_data[8] == 0x2d:  # SETUP PID
-                    self.sent_count += 1
-                    result["replayed"] += 1
+                # 解析 USB setup 包
+                # LINKTYPE_USB_2_0 格式: USB header (64 bytes) + setup data
+                # header offset 0x28 = endpoint, 0x08 = transfer_type
+                usb_hdr_offset = 0
+
+                # 检查是否为控制传输 (transfer_type=2 in USB_2_0 header)
+                if linktype == 288 and len(pkt_data) >= 72:
+                    # USB 2.0 header is 64 bytes, setup data starts at 64
+                    xfer_type = pkt_data[0x08] if len(pkt_data) > 0x08 else 0xFF
+                    setup_data = pkt_data[64:72] if len(pkt_data) >= 72 else b""
+
+                    if xfer_type == 2 and len(setup_data) >= 8:
+                        # 解析 8 字节 SETUP: bmRequestType, bRequest, wValue, wIndex, wLength
+                        bmrt = setup_data[0]
+                        breq = setup_data[1]
+                        wval = _struct.unpack_from("<H", setup_data, 2)[0]
+                        wind = _struct.unpack_from("<H", setup_data, 4)[0]
+                        wlen = _struct.unpack_from("<H", setup_data, 6)[0]
+
+                        req = ControlRequest(
+                            direction=bmrt & 0x80,
+                            req_type=bmrt & 0x60,
+                            recipient=bmrt & 0x03,
+                            bRequest=breq,
+                            wValue=wval,
+                            wIndex=wind,
+                            wLength=wlen,
+                            name=f"pcap replay SETUP",
+                        )
+                        self.send_single(req)
+                        result["replayed"] += 1
+
+                elif linktype == 189 and len(pkt_data) >= 64:
+                    # LINKTYPE_USB_LINUX 格式
+                    xfer_type = pkt_data[0] if len(pkt_data) > 0 else 0xFF
+                    setup_data = pkt_data[48:56] if len(pkt_data) >= 56 else b""
+
+                    if xfer_type == 2 and len(setup_data) >= 8:
+                        bmrt = setup_data[0]
+                        breq = setup_data[1]
+                        wval = _struct.unpack_from("<H", setup_data, 2)[0]
+                        wind = _struct.unpack_from("<H", setup_data, 4)[0]
+                        wlen = _struct.unpack_from("<H", setup_data, 6)[0]
+
+                        req = ControlRequest(
+                            direction=bmrt & 0x80,
+                            req_type=bmrt & 0x60,
+                            recipient=bmrt & 0x03,
+                            bRequest=breq,
+                            wValue=wval,
+                            wIndex=wind,
+                            wLength=wlen,
+                            name="pcap replay SETUP",
+                        )
+                        self.send_single(req)
+                        result["replayed"] += 1
 
                 time.sleep(0.001)  # 节流
 

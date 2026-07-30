@@ -1102,13 +1102,20 @@ class FuzzDeviceController:
         return interfaces
 
     async def _send_endpoint_data(self, device, data: bytes):
-        """通过端点发送数据（模拟设备主动发送）"""
+        """通过 Facedancer 端点主动发送数据 (设备→主机方向)"""
         try:
-            # 尝试通过 EP1 IN 发送
-            await asyncio.sleep(0.1)
-            log.info(f"  Sending {len(data)} bytes to host via EP1 IN...")
-        except Exception:
-            pass
+            if device and hasattr(device, 'backend') and device.backend:
+                # 通过 Facedancer 后端在 EP1 IN 上发送数据
+                device.backend.send_on_endpoint(
+                    endpoint_number=1,
+                    data=data,
+                    blocking=True,
+                )
+                log.info(f"  Sent {len(data)} bytes to host via EP1 IN")
+            else:
+                log.warning(f"  No backend — cannot send {len(data)} bytes on EP1 IN")
+        except Exception as e:
+            log.warning(f"  EP send failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
