@@ -73,6 +73,7 @@ class DeviceProfile:
     interfaces: list[dict] = field(default_factory=list)
     # 原始描述符 (如果有)
     raw_descriptor: bytes = b""
+    raw_descriptor_hex: str = ""  # 配置描述符 hex (clone 时设置)
     # 标签
     category: str = "hid"      # hid/storage/net/serial/audio/vendor
     description: str = ""

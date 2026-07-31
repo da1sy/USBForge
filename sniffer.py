@@ -36,6 +36,37 @@ _CAP_DIR = Path.home() / ".cynthion-mcp" / "captures"
 # USB 事务类型
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# USB CRC5 多项式表 — 对应 Wireshark crc5_usb_11bit_input() (USB 2.0 spec §8.3.5.1)
+# 每条目 = 输入位 i 置 1 时对寄存器的影响
+_CRC5_BVALS = [
+    0x1e, 0x15, 0x03, 0x06, 0x0c, 0x18, 0x19, 0x1b,
+    0x1f, 0x17, 0x07, 0x0e, 0x1c, 0x11, 0x0b, 0x16,
+    0x05, 0x0a, 0x14,
+]
+
+
+def _usb_crc5(v: int, vl: int = 11) -> int:
+    """计算 USB 11 位 token/SOF 字段的 CRC5 (多项式 x^5+x^2+1, 种子 0x02)。"""
+    rv = 0x02
+    for i in range(vl):
+        if v & (1 << i):
+            rv ^= _CRC5_BVALS[19 - vl + i]
+    return rv
+
+
+def _usb_crc16(data: bytes) -> int:
+    """计算 USB 数据包 payload 的 CRC16 (多项式 0x8005 反射, 种子/异或 0xFFFF)。"""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc ^ 0xFFFF
+
+
 class PacketType(IntEnum):
     SETUP = 0   # SETUP token
     IN = 1      # IN token
@@ -57,18 +88,68 @@ class DeviceSpeed(IntEnum):
     SUPER = 3   # 5 Gbps
 
 
+# 标准 USB 2.0 PID 值 (USB spec Table 8-1) → 名称 / PacketType
 PID_MAP = {
     0xe1: ("OUT", PacketType.OUT),
     0x69: ("IN", PacketType.IN),
-    0xe5: ("SOF", PacketType.SOF),
+    0xa5: ("SOF", PacketType.SOF),
     0x2d: ("SETUP", PacketType.SETUP),
-    0xd2: ("DATA0", PacketType.DATA0),
-    0xd3: ("DATA1", PacketType.DATA1),
-    0x4a: ("ACK", PacketType.ACK),
+    0xc3: ("DATA0", PacketType.DATA0),
+    0x4b: ("DATA1", PacketType.DATA1),
+    0x87: ("DATA2", PacketType.DATA0),   # high-speed
+    0x0f: ("MDATA", PacketType.DATA0),   # high-speed
+    0xd2: ("ACK", PacketType.ACK),
     0x5a: ("NAK", PacketType.NAK),
     0x1e: ("STALL", PacketType.STALL),
+    0x96: ("NYET", PacketType.NAK),      # high-speed
+    0x3c: ("PRE/ERR", PacketType.STALL),
+    0x78: ("SPLIT", PacketType.SPLIT),   # high-speed
     0xb4: ("PING", PacketType.PING),
+    0xf0: ("EXT", PacketType.SPLIT),
 }
+
+# PacketType → 线上 PID 字节 (标准 USB 线上 PID 值, 与 LINKTYPE_USB_2_0 pcap 一致)
+_WIRE_PID = {
+    PacketType.SETUP: 0x2D,
+    PacketType.IN: 0x69,
+    PacketType.OUT: 0xE1,
+    PacketType.DATA0: 0xC3,
+    PacketType.DATA1: 0x4B,
+    PacketType.ACK: 0xD2,
+    PacketType.NAK: 0x5A,
+    PacketType.STALL: 0x1E,
+    PacketType.SOF: 0xA5,
+    PacketType.PING: 0xB4,
+}
+
+
+def _encode_link_frame(pkt: 'USBPacket', sof_counter: int = 0) -> bytes:
+    """把解码后的 USBPacket 重建为链路层线上字节 (PID 开头, 含 CRC)。
+
+    与 Cynthion analyzer 捕获的 LINKTYPE_USB_2_0 pcap 记录格式一致:
+      · token (SETUP/IN/OUT/PING)   : PID + 2B (ADDR+ENDP+CRC5)
+      · SOF                         : PID + 2B (framenum+CRC5)
+      · DATA0/DATA1                 : PID + payload + CRC16 (LE)
+      · handshake (ACK/NAK/STALL)   : PID
+    """
+    ptype = pkt.packet_type
+    pid = _WIRE_PID.get(ptype, pkt.pid or 0)
+    payload = pkt.data or b""
+
+    if ptype in (PacketType.SETUP, PacketType.IN, PacketType.OUT, PacketType.PING):
+        field = (pkt.device_addr & 0x7F) | ((pkt.endpoint & 0x0F) << 7)
+        word = (_usb_crc5(field) << 11) | field
+        return bytes([pid, word & 0xFF, (word >> 8) & 0xFF])
+    if ptype == PacketType.SOF:
+        frame = sof_counter & 0x7FF
+        word = (_usb_crc5(frame) << 11) | frame
+        return bytes([pid, word & 0xFF, (word >> 8) & 0xFF])
+    if ptype in (PacketType.DATA0, PacketType.DATA1):
+        crc = _usb_crc16(payload)
+        return bytes([pid]) + payload + crc.to_bytes(2, "little")
+    # handshake / 未知类型
+    return bytes([pid])
+
 
 # MCP tshark PID names → PacketType (tshark uses lowercase hex PID values)
 # Maps the pid_name strings from summarise_packet() to our PacketType enum
@@ -283,16 +364,28 @@ class USBSniffer:
         self.packets: list[USBPacket] = []
         self._max_packets = 10000  # ring buffer
         self._callbacks: list[Callable] = []
+        self._batch_callbacks: list[Callable] = []
         self.current_capture_file: Optional[Path] = None
         self.last_capture_id: Optional[str] = None  # MCP capture_id of last session
 
     def add_callback(self, cb: Callable):
         self._callbacks.append(cb)
 
+    def add_batch_callback(self, cb: Callable):
+        """注册批量回调 — 用于一次性加载大量数据包(如 MCP dissect 结果)"""
+        self._batch_callbacks.append(cb)
+
     def _notify(self, packet: USBPacket):
         for cb in self._callbacks:
             try:
                 cb(packet)
+            except Exception:
+                pass
+
+    def _notify_batch(self, packets: list):
+        for cb in self._batch_callbacks:
+            try:
+                cb(packets)
             except Exception:
                 pass
 
@@ -322,11 +415,11 @@ class USBSniffer:
         return True
 
     def stop(self) -> dict:
-        """停止捕获"""
+        """停止捕获 — 设置停止标志，立即返回(不等 MCP 解析)"""
         self.is_capturing = False
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=2)
             self._thread = None
 
         return {
@@ -369,13 +462,9 @@ class USBSniffer:
         cap_data = r.get("data", {})
         self.last_capture_id = cap_data.get("id", "")
 
-        # 2) 等待用户停止 — 轮询 capture_status 保持活跃
+        # 2) 等待用户停止 — 轻量轮询, 不每轮调 MCP
         while not self._stop_event.is_set():
-            st = bridge.capture_status()
-            # 只要 bridge 还活着就继续
-            if not st.get("ok"):
-                break
-            time.sleep(0.3)
+            time.sleep(0.2)
 
         # 3) 停止捕获
         stop_r = bridge.capture_stop()
@@ -388,18 +477,44 @@ class USBSniffer:
         if self.last_capture_id:
             self._load_packets_from_mcp(bridge, self.last_capture_id)
 
-    def _load_packets_from_mcp(self, bridge, capture_id: str, limit: int = 500):
-        """从 MCP dissect_packets 结果加载真实数据包到 self.packets"""
+    def _load_packets_from_mcp(self, bridge, capture_id: str, limit: int = 2000):
+        """从 MCP dissect_packets 结果加载真实数据包到 self.packets (批量模式)"""
         r = bridge.dissect_packets(capture_id, limit=limit)
         if not r.get("ok"):
             return
 
         data = r.get("data", {})
         pkts = data.get("packets", [])
+        batch: list[USBPacket] = []
         for p in pkts:
             pkt = self._mcp_packet_to_usbpacket(p)
             if pkt:
-                self._add_packet(pkt)
+                # 直接更新内部状态，不触发逐包回调(避免 UI 洪泛)
+                self.packets.append(pkt)
+                if len(self.packets) > self._max_packets:
+                    self.packets.pop(0)
+                self.stats.total_packets += 1
+                self.stats.by_device[pkt.device_addr] = self.stats.by_device.get(pkt.device_addr, 0) + 1
+                self.stats.by_type[pkt.pid_name] = self.stats.by_type.get(pkt.pid_name, 0) + 1
+                if pkt.is_setup:
+                    self.stats.setup_count += 1
+                elif pkt.is_data:
+                    self.stats.data_count += 1
+                elif pkt.pid_name == "ACK":
+                    self.stats.ack_count += 1
+                elif pkt.pid_name == "NAK":
+                    self.stats.nak_count += 1
+                elif pkt.pid_name == "STALL":
+                    self.stats.stall_count += 1
+
+                batch.append(pkt)
+                # 分批发送，每 200 条一批
+                if len(batch) >= 200:
+                    self._notify_batch(batch)
+                    batch.clear()
+        # 发送剩余的
+        if batch:
+            self._notify_batch(batch)
 
     @staticmethod
     def _mcp_packet_to_usbpacket(p: dict) -> Optional['USBPacket']:
@@ -517,12 +632,15 @@ class USBSniffer:
         self._notify(pkt)
 
     def export_pcap(self, filepath: Optional[Path] = None) -> Path:
-        """导出为 pcap 格式"""
+        """导出为 pcap 格式 (LINKTYPE_USB_2_0 = 288)。
+
+        LINKTYPE_USB_2_0 记录内容是原始链路层线上字节 (PID 开头, 含 CRC),
+        与 Cynthion analyzer 捕获格式一致 — Wireshark/tshark 的 usbll dissector 直接消费。
+        """
         if filepath is None:
             filepath = _CAP_DIR / f"export_{int(time.time())}.pcap"
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
-        # LINKTYPE_USB_2_0 = 288, the linktype consumed by Wireshark/tshark USB dissector
         with open(filepath, "wb") as f:
             # pcap global header (little-endian, microsecond timestamps)
             f.write(b"\xd4\xc3\xb2\xa1")  # magic (little-endian host byte order)
@@ -531,21 +649,22 @@ class USBSniffer:
             f.write((0).to_bytes(4, "little"))  # thiszone
             f.write((0).to_bytes(4, "little"))  # sigfigs
             f.write((65535).to_bytes(4, "little"))  # snaplen
-            f.write((288).to_bytes(4, "little"))  # LINKTYPE_USB_2_0 = 288 (not 248)
+            f.write((288).to_bytes(4, "little"))  # LINKTYPE_USB_2_0 = 288
 
+            sof_counter = 0
             for pkt in self.packets:
                 ts = int(pkt.timestamp)
                 ts_us = int((pkt.timestamp - ts) * 1e6)
-                pkt_data = pkt.raw_hex and bytes.fromhex(pkt.raw_hex) or pkt.data
-                if not pkt_data:
-                    pkt_data = bytes([pkt.pid])
-                cap_len = len(pkt_data)
+                if pkt.packet_type == PacketType.SOF:
+                    sof_counter += 1
+                frame = _encode_link_frame(pkt, sof_counter)
+                cap_len = len(frame)
 
                 f.write(ts.to_bytes(4, "little"))
                 f.write(ts_us.to_bytes(4, "little"))
                 f.write(cap_len.to_bytes(4, "little"))
                 f.write(cap_len.to_bytes(4, "little"))
-                f.write(pkt_data)
+                f.write(frame)
 
         return filepath
 

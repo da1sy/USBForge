@@ -328,8 +328,9 @@ class PacketInjector:
             from facedancer.backends.libusbhost import LibUSBHostApp
             self._host = LibUSBHostApp()
             self._host.connect()
-        except Exception:
+        except Exception as e:
             self._host = None
+            self._notify({"event": "host_connect_failed", "message": str(e)})
 
     def add_callback(self, cb: Callable):
         self._callbacks.append(cb)

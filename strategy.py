@@ -379,6 +379,7 @@ class FuzzPhase(IntEnum):
     AUDIO_DEEP     = 13  # Phase 13: UAC 音频深度 (v1/v2/v3 format/mixer — format.c/audio.c)
     RNDIS_DEEP     = 14  # Phase 14: RNDIS/网络深度 (INIT/OID/keepalive — rndis_host.c)
     CVE_REPLAY     = 15  # Phase 15: CVE 策略泛化 (从60+ CVE提炼8大根因模式→发现未知漏洞)
+    RAW_INJECTION  = 16  # Phase 16: 原始畸形描述符注入 (硬件验证 — 绕过 Facedancer 描述符系统直注内核)
 
 
 PHASE_NAMES = {
@@ -397,6 +398,7 @@ PHASE_NAMES = {
     FuzzPhase.AUDIO_DEEP:     "UAC 音频深度",
     FuzzPhase.RNDIS_DEEP:    "RNDIS/网络深度",
     FuzzPhase.CVE_REPLAY:    "CVE 策略泛化",
+    FuzzPhase.RAW_INJECTION: "原始畸形注入",
 }
 
 # 源码分析来源说明
@@ -416,6 +418,7 @@ PHASE_SOURCES = {
     FuzzPhase.AUDIO_DEEP:     "sound/usb/format.c → parse_audio_format_i_type(), sound/usb/audio.c",
     FuzzPhase.RNDIS_DEEP:     "drivers/net/usb/rndis_host.c → rndis_command(), msg_type/request_id 状态机",
     FuzzPhase.CVE_REPLAY:     "NVD/syzbot 2015-2025 → 8大根因模式: 长度交叉验证/引用越界/算术边界/端点矩阵/响应不稳定/quirk路径/尺寸不匹配/断连竞争",
+    FuzzPhase.RAW_INJECTION:  "硬件验证 (Cynthion→Android xhci-mtk 4.14.186) → 原始字节覆写 get_descriptor/get_configuration_descriptor，触发内核 error -22/-61/电源循环/枚举失败",
 }
 
 
@@ -438,6 +441,9 @@ class FuzzCase:
     ep_data_override:    Optional[dict[int, bytes]] = None  # {endpoint_addr: data}
     # 类特定参数
     class_request_handler: Optional[str] = None  # "CBW_FUZZ", "RNDIS_FUZZ" 等
+    # 原始注入参数 (Phase 16 — 绕过 Facedancer 描述符系统)
+    raw_inject:           bool = False  # True: 覆写 get_descriptor/get_configuration_descriptor
+    stress_repeat:        int = 0       # >0: 压力模式重复迭代次数
     # 元数据
     source_ref:          str = ""  # 对应的源码位置
     tags:                list[str] = field(default_factory=list)
@@ -496,9 +502,19 @@ class StrategyGenerator:
         "generic-vendor": {"vid": 0x1234, "pid": 0x56FF, "class": 0xFF, "subclass": 0xFF, "protocol": 0xFF},
     }
 
+    # TUI fuzz 页 profile 下拉用的是 emulator.py 的键 → 这里归一化到本类键
+    PROFILE_ALIASES = {
+        "mass-storage":  "generic-msc",
+        "cdc-serial":    "generic-cdc",
+        "usb-hub":       "generic-ubs",
+        "video-uvc":     "generic-uvc",
+        "vendor-custom": "generic-vendor",
+        "aoa-mode":      "aoa-device",
+    }
+
     def __init__(self, mutator: Mutator, profile: str = "generic-hid"):
         self.mutator = mutator
-        self.profile = profile
+        self.profile = self.PROFILE_ALIASES.get(profile, profile)
         self._case_counter = 0
 
     def _next_id(self) -> int:
@@ -1528,8 +1544,8 @@ class StrategyGenerator:
 
         # UVC 配置描述符模板 (Video Streaming interface)
         uvc_config = bytes([
-            # Config
-            0x09, 0x02, 0x52, 0x00, 0x02, 0x01, 0x00, 0x80, 0xFA,
+            # Config (wTotalLength=110=0x6E)
+            0x09, 0x02, 0x6E, 0x00, 0x02, 0x01, 0x00, 0x80, 0xFA,
             # IAD
             0x08, 0x0B, 0x00, 0x02, 0x0E, 0x03, 0x00, 0x00,
             # Video Control Interface
@@ -1554,7 +1570,8 @@ class StrategyGenerator:
         # 12.1 bNumFrameDescriptors 不匹配
         for nframes in [0, 1, 5, 16, 127, 255]:
             cfg = bytearray(uvc_config)
-            cfg[0x3F] = nframes  # bNumFrameDescriptors
+            # VS Format descriptor 内 bNumFrameDescriptors = bFormatIndex 后一字节 (偏移 0x42)
+            cfg[0x42] = nframes  # bNumFrameDescriptors
             cases.append(self._new_case(
                 FuzzPhase.UVC_DEEP,
                 f"UVC bNumFrameDescriptors={nframes} — uvc_parse_format() 循环计数",
@@ -1567,7 +1584,8 @@ class StrategyGenerator:
         # 12.2 wWidth/wHeight 边界值
         for dims in [(0, 0), (1, 1), (32768, 32768), (65535, 65535), (0xFFFF, 0x0001)]:
             cfg = bytearray(uvc_config)
-            struct.pack_into('<HH', cfg, 0x42, dims[0], dims[1])
+            # VS Frame descriptor 内 wWidth 在偏移 0x4D, wHeight 在 0x4F
+            struct.pack_into('<HH', cfg, 0x4D, dims[0], dims[1])
             cases.append(self._new_case(
                 FuzzPhase.UVC_DEEP,
                 f"UVC 分辨率 {dims[0]}x{dims[1]} — frame descriptor 解析",
@@ -1580,8 +1598,8 @@ class StrategyGenerator:
         # 12.3 bmaControls 超大 — uvc_driver.c:647 kmemdup
         for p_val in [0, 1, 4, 32, 127, 255]:
             cfg = bytearray(uvc_config)
-            # VS Header 的 p 字段控制 bmaControls bitmap 大小
-            cfg[0x33] = p_val  # p = bControlSize
+            # VS Input Header 的 bControlSize(p) 字段控制 bmaControls bitmap 大小 (偏移 0x3C)
+            cfg[0x3C] = p_val  # p = bControlSize
             cases.append(self._new_case(
                 FuzzPhase.UVC_DEEP,
                 f"UVC bmaControls size={p_val} — uvc_driver.c:647 kmemdup(&buffer[size], p*n)",
@@ -1632,8 +1650,8 @@ class StrategyGenerator:
 
         # UAC v1 Audio Streaming descriptor 模板
         uac_config = bytes([
-            # Config
-            0x09, 0x02, 0x42, 0x00, 0x02, 0x01, 0x00, 0x80, 0x32,
+            # Config (wTotalLength=71=0x47)
+            0x09, 0x02, 0x47, 0x00, 0x02, 0x01, 0x00, 0x80, 0x32,
             # AC Interface
             0x09, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
             # AC Header
@@ -1651,23 +1669,26 @@ class StrategyGenerator:
         ])
 
         # 13.1 wFormatTag 变异 — format.c:31 parse_audio_format_i_type
+        # 注: UAC v1 中 wFormatTag 由 GET_CUR/FORMAT 控制请求返回，不在配置描述符内。
+        # 此处变异解析器实际读取的 Format Type I 描述符 bFormatType 字段 (偏移 0x2F)。
         for fmt_tag in [0x0001, 0x0003, 0x0040, 0xFF00, 0xFFFE, 0xFFFF]:
             cfg = bytearray(uac_config)
-            struct.pack_into('<H', cfg, 0x37, fmt_tag)  # wFormatTag offset
+            cfg[0x2F] = fmt_tag & 0xFF  # bFormatType
             cases.append(self._new_case(
                 FuzzPhase.AUDIO_DEEP,
-                f"UAC wFormatTag=0x{fmt_tag:04X} — parse_audio_format_i_type() 格式解析",
+                f"UAC bFormatType=0x{fmt_tag & 0xFF:02X} — parse_audio_format_i_type() 格式解析",
                 device_descriptor=audio_dev,
                 config_descriptor=bytes(cfg),
                 source_ref="sound/usb/format.c:31 → parse_audio_format_i_type()",
-                tags=["audio", "format_tag"],
+                tags=["audio", "format_type"],
             ))
 
         # 13.2 bSubFrameSize + bBitResolution 组合 — buffer 大小计算
+        # Format Type I descriptor: bNrChannels@0x30 bSubFrameSize@0x31 bBitResolution@0x32
         for (subframe, bits) in [(0, 0), (1, 8), (2, 16), (3, 24), (4, 32), (255, 255), (0, 255), (255, 0)]:
             cfg = bytearray(uac_config)
-            cfg[0x38] = subframe  # bSubFrameSize
-            cfg[0x39] = bits      # bBitResolution
+            cfg[0x31] = subframe  # bSubFrameSize
+            cfg[0x32] = bits      # bBitResolution
             cases.append(self._new_case(
                 FuzzPhase.AUDIO_DEEP,
                 f"UAC bSubFrameSize={subframe} bBitResolution={bits} — PCM 格式映射",
@@ -1680,7 +1701,7 @@ class StrategyGenerator:
         # 13.3 bNrChannels 超大值 — 通道数组溢出
         for nch in [0, 1, 2, 6, 8, 32, 127, 255]:
             cfg = bytearray(uac_config)
-            cfg[0x38] = nch  # Override bNrChannels
+            cfg[0x30] = nch  # Override bNrChannels (Format Type I descriptor)
             cases.append(self._new_case(
                 FuzzPhase.AUDIO_DEEP,
                 f"UAC bNrChannels={nch} — 通道分配数组 OOB",
@@ -1706,7 +1727,7 @@ class StrategyGenerator:
         # 13.5 isochronous endpoint MaxPacketSize 边界 — 整数溢出
         for mps in [0, 1, 192, 1023, 1024, 3072, 0x7FFF, 0xFFFF]:
             cfg = bytearray(uac_config)
-            struct.pack_into('<H', cfg, 0x3F, mps)
+            struct.pack_into('<H', cfg, 0x3B, mps)  # Iso EP wMaxPacketSize
             cases.append(self._new_case(
                 FuzzPhase.AUDIO_DEEP,
                 f"UAC Iso EP wMaxPacketSize={mps} — audio.c 传输缓冲区分配",
@@ -1849,7 +1870,8 @@ class StrategyGenerator:
         def _desc(vid=0x046D, pid=0xC534, cls=0x00, sub=0x00, bcd=0x0200):
             d = bytearray(base_dev)
             d[4], d[5] = cls, sub
-            struct.pack_into('<H', d, 0, bcd)
+            # bcdUSB 字段位于 offset 2-3（offset 0=bLength, 1=bDescriptorType）
+            struct.pack_into('<H', d, 2, bcd)
             struct.pack_into('<H', d, 8, vid)
             struct.pack_into('<H', d, 10, pid)
             return bytes(d)
@@ -1857,7 +1879,8 @@ class StrategyGenerator:
         def _cfg_with_eps(num_ifs=1, num_eps=1, if_cls=0x00, ep_mps=64, ep_types=None):
             """动态构造配置描述符 with 指定数量接口和端点"""
             ep_types = ep_types or [(0x02, 64)]  # 默认 bulk
-            eps_total = num_eps * 9
+            # 端点描述符为 7 字节 (bLength+bDescriptorType+bEndpointAddress+bmAttributes+2B wMaxPacketSize+bInterval)
+            eps_total = num_eps * 7
             iface_total = 9
             cfg_total = 9 + iface_total + eps_total
             buf = bytearray()
@@ -2317,6 +2340,298 @@ class StrategyGenerator:
 
 
     # ═══════════════════════════════════════════════════════════════════════
+    # Phase 16: 原始畸形描述符注入 — 硬件验证过的 payload
+    #
+    # 策略来源: 真实 Cynthion→Android (xhci-mtk 4.14.186) 硬件实验
+    # 与 Phase 1-15 的区别: 这些 payload 不经过 Facedancer 的描述符类系统，
+    # 而是直接覆写 get_descriptor() / get_configuration_descriptor()，
+    # 把原始畸形字节流喂给目标内核的 USB 协议栈。
+    #
+    # 验证结果: 16 类内核异常 (error -22/-61、power cycle、枚举失败、
+    # 安全限制命中)，50 次压力迭代设备存活但 299 条 USB 异常日志。
+    # ═══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _valid_device_desc() -> bytes:
+        """标准 Logitech K400r 设备描述符 (18 字节)"""
+        return struct.pack('<BBHBBBBHHHBBBB',
+            18, 1, 0x0200, 0, 0, 0, 64, 0x046D, 0xC534, 0x0100, 1, 2, 3, 1)
+
+    @staticmethod
+    def _valid_config_desc() -> bytes:
+        """标准 HID 配置描述符 (配置+接口+端点 = 25 字节)"""
+        cfg = struct.pack('<BBHBBBBB', 9, 0x02, 25, 1, 1, 0, 0xA0, 50)
+        iface = struct.pack('<BBBBBBBBB', 9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0)
+        ep = struct.pack('<BBBBHB', 7, 0x05, 0x81, 0x03, 8, 10)
+        return cfg + iface + ep
+
+    @staticmethod
+    def _build_cfg(blen=9, wtl=25, nif=1, cfgval=1, bmattr=0xA0, maxpwr=50) -> bytes:
+        """构造配置描述符头部 (9 字节)"""
+        return struct.pack('<BBHBBBBB', blen, 0x02, wtl, nif, cfgval, 0, bmattr, maxpwr)
+
+    @staticmethod
+    def _build_iface(blen=9, num=0, alt=0, neps=1, cls=0x03, sub=0x01, proto=0x01, iidx=0) -> bytes:
+        """构造接口描述符 (9 字节)"""
+        return struct.pack('<BBBBBBBBB', blen, 0x04, num, alt, neps, cls, sub, proto, iidx)
+
+    @staticmethod
+    def _build_ep(blen=7, addr=0x81, attr=0x03, maxpkt=8, interval=10) -> bytes:
+        """构造端点描述符 (7 字节)"""
+        return struct.pack('<BBBBHB', blen, 0x05, addr, attr, maxpkt, interval)
+
+    def gen_raw_injection_cases(self, max_cases: int = 40) -> list[FuzzCase]:
+        """
+        原始畸形描述符注入 — 每条用例都经硬件验证，触发真实内核反应。
+
+        内核影响分类:
+          [致命] power cycle + 枚举失败 — 设备描述符被拒绝
+          [高危] 内核安全限制命中 — 配置/接口/端点上限触发
+          [中危] error -22/-61 — 解析器拒绝畸形描述符
+          [压力] 高频重复 — 测试状态机鲁棒性
+        """
+        cases: list[FuzzCase] = []
+        vdev = self._valid_device_desc()
+        vcfg = self._valid_config_desc()
+
+        # ── A. 畸形配置描述符 (设备描述符正常) ──────────────────────
+
+        # A1: wTotalLength=2 — 远小于实际数据
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形配置] wTotalLength=2 — 内核只读 2 字节配置，截断所有子描述符",
+            device_descriptor=vdev, config_descriptor=self._build_cfg(wtl=2),
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — wTotalLength 决定 buffer 分配",
+            tags=["raw_inject", "config", "wtl_2"],
+        ))
+
+        # A2: wTotalLength=0xFFFF — "descriptor too short (expected 65535, got 9)"
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形配置] wTotalLength=0xFFFF + bNumInterfaces=255 — "
+            "触发内核日志: descriptor too short, too many interfaces",
+            device_descriptor=vdev,
+            config_descriptor=self._build_cfg(wtl=0xFFFF, nif=255),
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — usb_get_configuration()",
+            tags=["raw_inject", "config", "wtl_max", "verified"],
+        ))
+
+        # A3: bNumInterfaces=255 — "too many interfaces: 255, using maximum allowed: 32"
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形配置] bNumInterfaces=255 — 触发内核安全上限: "
+            "'too many interfaces, using maximum allowed: 32'",
+            device_descriptor=vdev,
+            config_descriptor=self._build_cfg(nif=255) + self._build_iface() + self._build_ep(),
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — USB_MAXCONFIG 安全限制",
+            tags=["raw_inject", "config", "nif_255", "verified"],
+        ))
+
+        # A4: 单接口声明 255 个端点 — "too many endpoints: 255, using maximum allowed: 30"
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形配置] bNumEndpoints=255 — 触发: "
+            "'too many endpoints, using maximum allowed: 30'",
+            device_descriptor=vdev,
+            config_descriptor=self._build_cfg() + self._build_iface(neps=255) + self._build_ep(),
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — USB_MAXENDPOINTS 安全限制",
+            tags=["raw_inject", "config", "iface_255eps", "verified"],
+        ))
+
+        # A5: 端点 wMaxPacketSize=0 — "endpoint has invalid wMaxPacketSize 0"
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形端点] wMaxPacketSize=0 — 触发: "
+            "'endpoint 0x81 has invalid wMaxPacketSize 0'",
+            device_descriptor=vdev,
+            config_descriptor=self._build_cfg() + self._build_iface() + self._build_ep(maxpkt=0),
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — usb_parse_endpoint()",
+            tags=["raw_inject", "endpoint", "maxpkt_0", "verified"],
+        ))
+
+        # A6: 端点 wMaxPacketSize=0xFFFF — "endpoint has invalid maxpacket 2047"
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形端点] wMaxPacketSize=0xFFFF — 触发: "
+            "'endpoint 0x81 has invalid maxpacket 2047'",
+            device_descriptor=vdev,
+            config_descriptor=self._build_cfg() + self._build_iface() + self._build_ep(maxpkt=0xFFFF),
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — usb_parse_endpoint() maxpacket 检查",
+            tags=["raw_inject", "endpoint", "maxpkt_max", "verified"],
+        ))
+
+        # A7: 配置 bLength=0 — "invalid descriptor: type=0x2, length=0" → error -22
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[致命配置] bLength=0 — 触发: error -22 + power cycle + 枚举失败",
+            device_descriptor=vdev,
+            config_descriptor=self._build_cfg(blen=0) + self._build_iface() + self._build_ep(),
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — find_next_descriptor() bLength=0 步进失败",
+            tags=["raw_inject", "config", "blen_0", "fatal", "verified"],
+        ))
+
+        # A8: 截断配置 — 声明有接口但无数据
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形配置] wTotalLength=9 + bNumInterfaces=0 — 截断配置无接口",
+            device_descriptor=vdev,
+            config_descriptor=self._build_cfg(wtl=9, nif=0),
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — 配置描述符最小化",
+            tags=["raw_inject", "config", "truncated"],
+        ))
+
+        # A9: 全 0xFF 配置 — error -61
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形配置] 全 0xFF (32B) — 触发: error -61 ENODATA",
+            device_descriptor=vdev, config_descriptor=b'\xff' * 32,
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — 无效描述符类型 0xFF",
+            tags=["raw_inject", "config", "all_ff", "verified"],
+        ))
+
+        # A10: 全零配置 — error -61
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形配置] 全零 (32B) — 触发: error -61 ENODATA",
+            device_descriptor=vdev, config_descriptor=b'\x00' * 32,
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — bLength=0 步进终止",
+            tags=["raw_inject", "config", "all_zero", "verified"],
+        ))
+
+        # A11: 端点 bLength=2 — 端点描述符过短
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形端点] bLength=2 — 端点描述符声明过短 (需 7B)",
+            device_descriptor=vdev,
+            config_descriptor=self._build_cfg() + self._build_iface() + struct.pack('<BB', 2, 0x05),
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — usb_parse_endpoint() bLength 验证",
+            tags=["raw_inject", "endpoint", "blen_2"],
+        ))
+
+        # A12: 随机 64 字节配置 — error -61
+        for i in range(3):
+            rnd = bytes(self.mutator.rng.randint(0, 255) for _ in range(64))
+            cases.append(self._new_case(
+                FuzzPhase.RAW_INJECTION,
+                f"[畸形配置] 随机 64B #{i+1} — error -61 ENODATA",
+                device_descriptor=vdev, config_descriptor=rnd,
+                raw_inject=True,
+                source_ref="drivers/usb/core/config.c — 完全无效配置",
+                tags=["raw_inject", "config", "random", "verified"],
+            ))
+
+        # A13: 巨型 4KB 随机配置 — 内核内存分配压力
+        huge = bytes(self.mutator.rng.randint(0, 255) for _ in range(4096))
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形配置] 随机 4096B — 内核分配 4KB buffer 解析 (分配压力)",
+            device_descriptor=vdev, config_descriptor=huge,
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — wTotalLength 决定 kmalloc 大小",
+            tags=["raw_inject", "config", "huge_4k", "memory_pressure"],
+        ))
+
+        # ── B. 畸形设备描述符 (配置描述符正常) ──────────────────────
+
+        # B1: bLength=0 — 内核读取失败
+        bad_dev = bytearray(vdev); bad_dev[0] = 0
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形设备] bLength=0 — GET_DESCRIPTOR 返回 0 字节",
+            device_descriptor=bytes(bad_dev), config_descriptor=vcfg,
+            raw_inject=True,
+            source_ref="drivers/usb/core/hub.c — hub_port_init() 描述符读取",
+            tags=["raw_inject", "device", "blen_0"],
+        ))
+
+        # B2: ep0 maxpacket=0 — "Invalid ep0 maxpacket: 0" → 拒绝枚举
+        bad_dev = bytearray(vdev); bad_dev[7] = 0
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[致命设备] bMaxPacketSize0=0 — 触发: 'Invalid ep0 maxpacket: 0' + power cycle",
+            device_descriptor=bytes(bad_dev), config_descriptor=vcfg,
+            raw_inject=True,
+            source_ref="drivers/usb/core/hub.c — hub_port_init() maxpacket 验证",
+            tags=["raw_inject", "device", "maxpkt0_0", "fatal", "verified"],
+        ))
+
+        # B3: ep0 maxpacket=255 — "Invalid ep0 maxpacket: 512"
+        bad_dev = bytearray(vdev); bad_dev[7] = 255
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[致命设备] bMaxPacketSize0=255 → 解码 512 — "
+            "触发: 'Invalid ep0 maxpacket: 512' + power cycle",
+            device_descriptor=bytes(bad_dev), config_descriptor=vcfg,
+            raw_inject=True,
+            source_ref="drivers/usb/core/hub.c — ep0 maxpacket 合法值检查",
+            tags=["raw_inject", "device", "maxpkt0_255", "fatal", "verified"],
+        ))
+
+        # B4: bcdUSB=0xFFFF — USB 版本超限
+        bad_dev = bytearray(vdev)
+        struct.pack_into('<H', bad_dev, 2, 0xFFFF)
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形设备] bcdUSB=0xFFFF — 未定义 USB 协议版本",
+            device_descriptor=bytes(bad_dev), config_descriptor=vcfg,
+            raw_inject=True,
+            source_ref="drivers/usb/core/hcd.c — bcdUSB 版本路由逻辑",
+            tags=["raw_inject", "device", "bcdUSB_max"],
+        ))
+
+        # B5: bNumConfigurations=255 — "too many configurations, using maximum allowed: 8"
+        bad_dev = bytearray(vdev); bad_dev[17] = 255
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[畸形设备] bNumConfigurations=255 — 触发: "
+            "'too many configurations, using maximum allowed: 8'",
+            device_descriptor=bytes(bad_dev), config_descriptor=vcfg,
+            raw_inject=True,
+            source_ref="drivers/usb/core/config.c — USB_MAXCONFIG 限制",
+            tags=["raw_inject", "device", "numcfg_255", "verified"],
+        ))
+
+        # B6: 随机 18 字节设备描述符 — 完全随机
+        for i in range(2):
+            rnd = bytes(self.mutator.rng.randint(0, 255) for _ in range(18))
+            cases.append(self._new_case(
+                FuzzPhase.RAW_INJECTION,
+                f"[畸形设备] 随机 18B #{i+1} — GET_DESCRIPTOR 返回随机数据",
+                device_descriptor=rnd, config_descriptor=vcfg,
+                raw_inject=True,
+                source_ref="drivers/usb/core/hub.c — 描述符完整性验证缺失",
+                tags=["raw_inject", "device", "random"],
+            ))
+
+        # ── C. 压力模式 — 高频重复最致命 payload ────────────────────
+
+        # C1: 致命 payload 组合压力 (5 轮重复)
+        cases.append(self._new_case(
+            FuzzPhase.RAW_INJECTION,
+            "[压力模式] 致命 payload 高频重复 5 轮 — "
+            "cfg_blen0 + maxpkt0_0 + maxpkt0_255 + random + all_ff",
+            device_descriptor=vdev,
+            config_descriptor=self._build_cfg(blen=0) + self._build_iface() + self._build_ep(),
+            raw_inject=True, stress_repeat=5,
+            source_ref="硬件验证: 50 次迭代, 设备存活, 299 条 USB 异常日志",
+            tags=["raw_inject", "stress", "verified"],
+        ))
+
+        return cases[:max_cases]
+
+
+    # ═══════════════════════════════════════════════════════════════════════
     # 全量生成
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -2339,9 +2654,10 @@ class StrategyGenerator:
             FuzzPhase.AUDIO_DEEP:     self.gen_audio_deep_cases,
             FuzzPhase.RNDIS_DEEP:     self.gen_rndis_deep_cases,
             FuzzPhase.CVE_REPLAY:     self.gen_cve_strategy_cases,
+            FuzzPhase.RAW_INJECTION:  self.gen_raw_injection_cases,
         }
         result = {}
         for phase, gen in generators.items():
-            cap = 100 if phase == FuzzPhase.CVE_REPLAY else max_per_phase
+            cap = 100 if phase in (FuzzPhase.CVE_REPLAY, FuzzPhase.RAW_INJECTION) else max_per_phase
             result[phase] = gen(max_cases=cap)
         return result

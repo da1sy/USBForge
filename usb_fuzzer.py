@@ -67,12 +67,25 @@ try:
     from facedancer.classes  import USBDeviceClass
     from facedancer.devices  import default_main
     from facedancer.types    import USBStandardRequests, USBRequestType, USBRequestRecipient
+    from facedancer.types    import DeviceSpeed
     from facedancer.core     import FacedancerUSBApp
     from facedancer.logging  import log
 except ImportError:
     print("[!] facedancer 未安装。请执行: pip install facedancer")
     print(f"    当前 Python: {sys.executable} ({sys.version.split()[0]})")
     sys.exit(1)
+
+
+# ─── 辅助: 字符串 → DeviceSpeed 枚举 ────────────────────────────────────────────
+_SPEED_MAP = {
+    "low":   DeviceSpeed.LOW,
+    "full":  DeviceSpeed.FULL,
+    "high":  DeviceSpeed.HIGH,
+}
+def _str_to_speed(s):
+    if isinstance(s, DeviceSpeed):
+        return s
+    return _SPEED_MAP.get(str(s).lower(), DeviceSpeed.FULL)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -820,7 +833,7 @@ class StrategyGenerator:
             b'%s%s%s%s%n%n%n%n' * 16,                    # 格式字符串
             b'A' * 65536,                                # 超大 (64KB)
             b'\xDE\xAD\xBE\xEF' * 256,                   # DEADBEEF 模式
-            bytes(random.randint(0, 255) for _ in range(512)),  # 随机垃圾
+            bytes(self.mutator.rng.randint(0, 255) for _ in range(512)),  # 随机垃圾
             b'',                                         # 空包
             b'\x00' * 0x10000,                           # 64KB 零
         ]
@@ -993,7 +1006,7 @@ class FuzzDeviceController:
             device_class           : int = dev_class
             device_subclass        : int = dev_subclass
             protocol_revision_number: int = dev_protocol
-            device_speed           : str = self.speed
+            device_speed           = _str_to_speed(self.speed)
 
             _fuzz_case      = case
             _ctrl_response  = ctrl_response
@@ -1040,9 +1053,12 @@ class FuzzDeviceController:
 
             # ── 拦截所有其他控制请求 ────────────────────────
 
-            @standard_request_handler
+            @standard_request_handler()
             def handle_all_requests(self, request):
                 """通用控制请求处理 — 返回变异数据或 STALL"""
+                # GET_DESCRIPTOR 由 handle_get_descriptor 专用处理，这里跳过
+                if request.number == STD_GET_DESCRIPTOR:
+                    return
                 if self._delay_ms > 0:
                     time.sleep(self._delay_ms / 1000.0)
                 if self._stall_ep0:
@@ -1050,11 +1066,11 @@ class FuzzDeviceController:
                     return
 
                 # 对 SET_CONFIGURATION 正常响应
-                if request.request == STD_SET_CONFIGURATION:
+                if request.number == STD_SET_CONFIGURATION:
                     request.ack()
-                elif request.request == STD_SET_ADDRESS:
+                elif request.number == STD_SET_ADDRESS:
                     request.ack()
-                elif request.request == STD_GET_STATUS:
+                elif request.number == STD_GET_STATUS:
                     request.reply(b'\x00\x00')
                 else:
                     # 其他请求返回变异数据

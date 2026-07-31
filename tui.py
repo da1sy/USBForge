@@ -58,7 +58,7 @@ import struct
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Callable
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -111,6 +111,11 @@ from emulator import (
 )
 
 from mcp_bridge import get_bridge, check_mcp_available
+
+from relay import (
+    RelayEngine, RelayFilter, RelayPolicy, RelayPacket, PacketAction,
+    list_target_devices,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -475,6 +480,58 @@ class USBForgeApp(App):
         margin: 0 0 1 0;
     }
 
+    /* ── Board wiring diagram (pure Textual widgets, no ASCII art) ── */
+    .board-diagram {
+        height: auto;
+        margin: 1 0 0 0;
+        padding: 0 0 1 0;
+        border-top: solid $boost;
+    }
+    .board-diagram-title {
+        color: $accent;
+        text-style: bold;
+        height: 1;
+        margin: 1 0 0 0;
+    }
+    .board-diagram-hint {
+        color: $text-muted;
+        height: auto;
+        margin: 1 0 0 0;
+    }
+    /* Port blocks row */
+    .board-ports-row {
+        height: auto;
+        margin: 1 0 0 0;
+    }
+    .board-ports-row > Vertical {
+        width: 1fr;
+        height: auto;
+        margin: 0 1 0 0;
+        padding: 0 1;
+        border: solid $boost;
+    }
+    .board-ports-row > Vertical:last-child {
+        margin-right: 0;
+    }
+    /* Highlight active ports vs inactive */
+    .board-port-active {
+        border: solid $accent !important;
+    }
+    .board-port-inactive {
+        border: dashed $boost !important;
+        color: $text-disabled;
+    }
+    .board-port-name {
+        text-style: bold;
+        height: 1;
+        margin: 0 0 0 0;
+    }
+    .board-port-device {
+        height: auto;
+        margin: 0;
+        color: $text;
+    }
+
     /* ── Status card ── */
     .status-card {
         padding: 0 0 0 0;
@@ -622,6 +679,7 @@ class USBForgeApp(App):
         self._relay_policy = "pass"
         self._relay_queue = []
         self._relay_thread = None
+        self._relay_engine: Optional[RelayEngine] = None
 
     def compose(self) -> ComposeResult:
         """构建主界面 — 标题栏 + 8 Tab + 状态栏"""
@@ -651,6 +709,130 @@ class USBForgeApp(App):
             with Horizontal(id="status-bar"):
                 yield Label("● 初始化中...", id="header-status")
                 yield Label("[1-9]切换Tab  D=刷新设备  Q=退出", id="status-hints")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Cynthion 板子接线示意图 — 纯 Textual 控件, 无 ASCII art
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _board_diagram(self, mode: str = "analyzer") -> ComposeResult:
+        """
+        纯 Textual 控件绘制的 Cynthion 板子接线图。
+        三个端口用带 border 的 Vertical 块表示, 每个 port 块内显示
+        端口名 + 该模式下接入的设备。活动端口实线高亮, 不用端口虚线灰化。
+        """
+        # 每种模式的配置:
+        #   title:       示意图标题
+        #   control:     Control 端口接什么设备 (None=不使用)
+        #   target_a:    Target-A 端口接什么设备 (None=不使用)
+        #   target_c:    Target-C 端口接什么设备 (None=不使用)
+        #   hint:        额外接线提示
+        configs = {
+            "device": {
+                "title": "Cynthion 接线 — 切换模式后参考对应 Tab",
+                "control": "测试机 (Mac)",
+                "target_a": "—",
+                "target_c": "目标设备 (DUT)",
+                "hint": "点击上方按钮切换 Facedancer / Analyzer 模式",
+            },
+            "analyzer": {
+                "title": "Analyzer 监听 — 串联嗅探",
+                "control": "测试机 (Mac)\n仅供电+控制",
+                "target_a": "USB Host\n(Mac/PC)",
+                "target_c": "DUT\n(被监听设备)",
+                "hint": "Cynthion 串联在 Host 和 DUT 之间, 被动嗅探 USB 流量",
+            },
+            "relay": {
+                "title": "Facedancer 中继 — USB MITM Proxy",
+                "control": "测试机 (Mac)\n供电+FPGA控制",
+                "target_a": "不使用",
+                "target_c": "DUT Host\n(车机/PC)",
+                "hint": "真实设备插 Mac USB 口 (NOT Target-A), 软件中继到 Target-C",
+            },
+            "inject": {
+                "title": "Facedancer 注入 — 向 DUT 发送控制请求",
+                "control": "测试机 (Mac)\n供电+FPGA控制",
+                "target_a": "不使用",
+                "target_c": "DUT Host\n(目标设备)",
+                "hint": "通过 Target-C 向 DUT 发送自定义 USB 控制请求",
+            },
+            "emulate": {
+                "title": "Facedancer 伪造 — Moondancer 模拟 USB 设备",
+                "control": "测试机 (Mac)\n供电+FPGA控制",
+                "target_a": "不使用",
+                "target_c": "DUT Host\n(被欺骗的主机)",
+                "hint": "DUT 会识别出一个伪造的 USB 设备 (自定义 VID/PID/描述符)",
+            },
+            "fuzz": {
+                "title": "Facedancer 模糊测试 — 发送畸形描述符",
+                "control": "测试机 (Mac)\n供电+FPGA控制",
+                "target_a": "不使用",
+                "target_c": "DUT Host\n(车机/IoT)",
+                "hint": "DUT 需通过 SSH/ADB 连接以监控崩溃日志",
+            },
+            "analyze": {
+                "title": "离线分析 — 无需 Cynthion 硬件",
+                "control": None,
+                "target_a": None,
+                "target_c": None,
+                "hint": "手动输入 hex 描述符或从抓包导入, 解析 USB 描述符结构和 SETUP 请求",
+            },
+            "stats": {
+                "title": "离线统计 — 无需 Cynthion 硬件",
+                "control": None,
+                "target_a": None,
+                "target_c": None,
+                "hint": "查看历史捕获数据, 全局活动日志",
+            },
+            "about": {
+                "title": "USBForge v3.0 — USB 安全测试套件",
+                "control": None,
+                "target_a": None,
+                "target_c": None,
+                "hint": "基于 Cynthion + Facedancer 框架",
+            },
+        }
+
+        cfg = configs.get(mode, configs["device"])
+
+        with Vertical(classes="board-diagram"):
+            yield Static(cfg["title"], classes="board-diagram-title")
+
+            # 只有硬件模式才显示端口块
+            if cfg["control"] is not None or cfg["target_a"] is not None or cfg["target_c"] is not None:
+                with Horizontal(classes="board-ports-row"):
+                    # Control 端口
+                    if cfg["control"]:
+                        with Vertical(classes="board-port-active"):
+                            yield Static("Control", classes="board-port-name")
+                            yield Static(cfg["control"], classes="board-port-device")
+                    else:
+                        with Vertical(classes="board-port-inactive"):
+                            yield Static("Control", classes="board-port-name")
+                            yield Static("不使用", classes="board-port-device")
+
+                    # Target-A 端口
+                    ta = cfg["target_a"]
+                    if ta and ta != "不使用" and ta != "—":
+                        with Vertical(classes="board-port-active"):
+                            yield Static("Target-A", classes="board-port-name")
+                            yield Static(ta, classes="board-port-device")
+                    else:
+                        with Vertical(classes="board-port-inactive"):
+                            yield Static("Target-A", classes="board-port-name")
+                            yield Static(ta if ta else "不使用", classes="board-port-device")
+
+                    # Target-C 端口
+                    if cfg["target_c"]:
+                        with Vertical(classes="board-port-active"):
+                            yield Static("Target-C", classes="board-port-name")
+                            yield Static(cfg["target_c"], classes="board-port-device")
+                    else:
+                        with Vertical(classes="board-port-inactive"):
+                            yield Static("Target-C", classes="board-port-name")
+                            yield Static("不使用", classes="board-port-device")
+
+            # 接线提示
+            yield Static(cfg["hint"], classes="board-diagram-hint")
 
     # ═══════════════════════════════════════════════════════════════════════
     # Tab 1: 设备 — 卡片式状态 + 模式选择
@@ -699,6 +881,9 @@ class USBForgeApp(App):
                         yield Button("Codex", id="btn-mcp-codex", variant="primary")
                         yield Button("Hermes", id="btn-mcp-hermes", variant="primary")
 
+                # 板子接线示意图
+                yield from self._board_diagram("device")
+
             # ── 右栏: 设备日志 ──
             with Vertical(id="right-panel"):
                 yield Label("设备日志", classes="panel-title")
@@ -735,6 +920,9 @@ class USBForgeApp(App):
                 yield Label("速率:   0 pps", id="sniff-stat-pps", classes="info-line")
                 yield Label("设备数: 0", id="sniff-stat-devs", classes="info-line")
 
+                # 板子接线示意图
+                yield from self._board_diagram("analyzer")
+
             with Vertical(id="right-panel"):
                 yield Label("数据包列表 (点击行查看详情)", classes="panel-title")
                 yield DataTable(id="sniff-packet-table")
@@ -751,14 +939,27 @@ class USBForgeApp(App):
         with Horizontal(classes="workspace"):
             # ── 左栏: 控制面板 ──
             with VerticalScroll(id="left-panel"):
-                yield Label("中继模式控制", classes="section-label")
+                yield Label("中继模式控制 (USB MITM Proxy)", classes="section-label")
                 with Horizontal(classes="btn-row"):
                     yield Button("▶ 启动中继", id="btn-relay-start", variant="success")
                     yield Button("⏹ 停止", id="btn-relay-stop", variant="error")
 
+                yield Label("目标设备 (插在 Mac USB 口上)", classes="section-label")
+                yield Input(
+                    placeholder="VID hex (如 0x0a12)",
+                    id="input-relay-vid",
+                )
+                yield Input(
+                    placeholder="PID hex (如 0x0001)",
+                    id="input-relay-pid",
+                )
+                with Horizontal(classes="btn-row"):
+                    yield Button("🔍 扫描设备", id="btn-relay-scan", variant="primary")
+                    yield Button("📋 列出设备", id="btn-relay-list")
+
                 yield Label("拦截策略", classes="section-label")
                 yield Select(
-                    [("🟢 放行所有 (Pass-through)", "pass"),
+                    [("🟢 放行所有 (Pass-through MITM)", "pass"),
                      ("🟡 暂停所有 (Hold all)", "hold"),
                      ("🔴 拦截 SETUP (SETUP only)", "setup"),
                      ("🟠 拦截 DATA (DATA only)", "data"),
@@ -792,6 +993,9 @@ class USBForgeApp(App):
                     yield Button("✅ 放行", id="btn-relay-forward", variant="success")
                     yield Button("🗑 丢弃", id="btn-relay-drop", variant="error")
                 yield Button("📤 发送修改", id="btn-relay-send")
+
+                # 板子接线示意图
+                yield from self._board_diagram("relay")
 
             # ── 右栏: 拦截队列 + 包内容 ──
             with Vertical(id="right-panel"):
@@ -835,6 +1039,9 @@ class USBForgeApp(App):
                 with Horizontal(classes="btn-row"):
                     yield Button("🔍 解析 SETUP 请求", id="btn-parse-setup", variant="success")
                     yield Button("📋 填入示例", id="btn-sample-setup")
+
+                # 板子接线示意图
+                yield from self._board_diagram("analyze")
 
             with Vertical(id="right-panel"):
                 yield Label("解析结果", classes="panel-title")
@@ -881,6 +1088,9 @@ class USBForgeApp(App):
                     yield Button("⏹ 停止", id="btn-batch-stop", variant="error")
 
                 yield Label("已发送: 0 / 错误: 0", id="inj-stats", classes="info-line")
+
+                # 板子接线示意图
+                yield from self._board_diagram("inject")
 
             with Vertical(id="right-panel"):
                 yield Label("注入日志", classes="panel-title")
@@ -950,6 +1160,9 @@ class USBForgeApp(App):
                 yield Label("描述符注入", classes="section-label")
                 yield Input(placeholder="设备描述符 hex (≥18 bytes)", id="emul-desc-inject")
                 yield Button("💉 注入描述符", id="btn-inject-desc", variant="warning")
+
+                # 板子接线示意图
+                yield from self._board_diagram("emulate")
 
             with Vertical(id="right-panel"):
                 yield Label("仿真日志", classes="panel-title")
@@ -1068,6 +1281,9 @@ class USBForgeApp(App):
                     yield Input(placeholder="随机种子", id="fuzz-seed", value="42")
                 yield Input(placeholder="用例间延迟 ms", id="fuzz-delay", value="500", type="integer")
 
+                # 板子接线示意图
+                yield from self._board_diagram("fuzz")
+
             with Vertical(id="right-panel"):
                 # ── 统计仪表盘 ──
                 with Horizontal(classes="btn-row"):
@@ -1119,6 +1335,9 @@ class USBForgeApp(App):
                 with Horizontal(classes="btn-row"):
                     yield Button("🔄 刷新统计", id="btn-refresh-stats")
                     yield Button("🗑 重置统计", id="btn-reset-stats", variant="error")
+
+                # 板子接线示意图
+                yield from self._board_diagram("stats")
 
             with Vertical(id="right-panel"):
                 yield Label("全局活动日志", classes="panel-title")
@@ -1308,6 +1527,9 @@ class USBForgeApp(App):
                     classes="about-text",
                 )
 
+                # 板子接线示意图
+                yield from self._board_diagram("about")
+
             # ── 右侧：作者 ASCII 头像 + 简介 ──
             with VerticalScroll(id="right-panel"):
 
@@ -1353,19 +1575,6 @@ class USBForgeApp(App):
     # Reactive 状态
     is_running = reactive(False)
 
-    def __init__(self):
-        super().__init__()
-        self.stats = GlobalStats()
-        self.sniffer = USBSniffer()
-        self.injector = PacketInjector()
-        self.emulator = DeviceEmulator()
-        self.all_cases: list[FuzzCase] = []
-        self._fuzz_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._pause_event = threading.Event()
-        self._device_status: Optional[dict] = None
-        self._monitor = None
-
     def on_mount(self) -> None:
         self.title = "USBForge"
         self.sub_title = "USB Security Suite"
@@ -1407,6 +1616,7 @@ class USBForgeApp(App):
 
         # 注册 sniffer 回调
         self.sniffer.add_callback(self._on_sniff_packet)
+        self.sniffer.add_batch_callback(self._on_sniff_batch)
 
         # 注册 injector 回调
         self.injector.add_callback(self._on_inject_event)
@@ -1624,14 +1834,6 @@ class USBForgeApp(App):
     def _on_btn_refresh_device(self):
         self._refresh_device_status()
 
-    def _on_btn_switch_mode(self):
-        """根据下拉选择器切换设备模式"""
-        mode = self.query_one("#select-device-mode", Select).value
-        if mode == "facedancer":
-            self._do_switch("facedancer")
-        elif mode == "analyzer":
-            self._do_switch("analyzer")
-
     # ── MCP Bridge ──
 
     def _init_mcp_bridge(self):
@@ -1662,7 +1864,7 @@ class USBForgeApp(App):
                 f"[yellow]⚠ MCP 初始化失败: {e}[/]"
             )
 
-    def _do_switch(self, target: str):
+    def _do_switch(self, target: str, on_done: Optional[Callable[[bool], None]] = None):
         label = "Facedancer" if target == "facedancer" else "Analyzer"
         self._log_device(f"[yellow]切换到 {label} 模式（约30-90秒，持久刷写 SPI flash）...[/]")
 
@@ -1677,6 +1879,8 @@ class USBForgeApp(App):
                     f"[red]❌ 切换失败 — 请检查设备连接后重试[/]")
 
             self.call_from_thread(self._refresh_device_status)
+            if on_done:
+                self.call_from_thread(on_done, ok)
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -1731,15 +1935,12 @@ class USBForgeApp(App):
         # 模式不匹配 — 弹窗确认
         def _on_mode_confirm(result):
             if result and result is not False:
-                # 用户确认切换 — 先切换再执行
+                # 用户确认切换 — 切换成功后（重新枚举完成）再执行回调
                 def _do_switch_then_callback():
-                    self._do_switch(required_mode)
-                    # 切换后延迟执行回调 (等设备重连)
-                    def _delayed():
-                        callback()
-                    timer = threading.Timer(3.0, lambda: self.call_from_thread(_delayed))
-                    timer.daemon = True
-                    timer.start()
+                    def _on_done(ok: bool):
+                        if ok:
+                            callback()
+                    self._do_switch(required_mode, on_done=_on_done)
 
                 threading.Thread(target=_do_switch_then_callback, daemon=True).start()
 
@@ -1951,20 +2152,29 @@ class USBForgeApp(App):
 
         # 显示停止信息
         try:
-            self.query_one("#sniff-packet-detail", RichLog).write(
+            detail = self.query_one("#sniff-packet-detail", RichLog)
+            detail.clear()
+            detail.write(
                 f"[red]⏹ 捕获已停止 — {result['total_packets']} 包, {result['elapsed']:.1f}s[/]")
             cap_id = result.get("capture_id", "")
             if cap_id:
-                self.query_one("#sniff-packet-detail", RichLog).write(
-                    f"[dim]捕获 ID: {cap_id}[/]")
-                # 自动转换为 pcap 以便 Wireshark 分析
-                bridge = get_bridge()
-                if bridge.available:
-                    pcap_r = bridge.convert_to_pcap(cap_id)
-                    if pcap_r.get("ok"):
-                        pd = pcap_r.get("data", {})
-                        self.query_one("#sniff-packet-detail", RichLog).write(
-                            f"[green]✓ PCAP 已生成: {pd.get('packets', 0)} 包[/]")
+                detail.write(f"[dim]捕获 ID: {cap_id}[/]")
+                detail.write("[yellow]⏳ 正在解析数据包... (后台进行)[/]")
+
+                # 在后台线程做 pcap 转换 (不阻塞 UI)
+                def _bg_pcap():
+                    try:
+                        bridge = get_bridge()
+                        if bridge.available:
+                            pcap_r = bridge.convert_to_pcap(cap_id)
+                            if pcap_r.get("ok"):
+                                pd = pcap_r.get("data", {})
+                                msg = f"[green]✓ PCAP 已生成: {pd.get('packets', 0)} 包[/]"
+                                self.call_from_thread(lambda: detail.write(msg))
+                    except:
+                        pass
+
+                threading.Thread(target=_bg_pcap, daemon=True).start()
         except:
             pass
 
@@ -1996,6 +2206,13 @@ class USBForgeApp(App):
         """sniffer 回调 — 在工作线程中调用"""
         try:
             self.call_from_thread(self._add_packet_row, pkt)
+        except:
+            pass
+
+    def _on_sniff_batch(self, packets: list):
+        """sniffer 批量回调 — 在工作线程中调用，一次性添加多行"""
+        try:
+            self.call_from_thread(self._add_packet_batch, packets)
         except:
             pass
 
@@ -2058,6 +2275,48 @@ class USBForgeApp(App):
         except:
             pass
 
+    def _add_packet_batch(self, packets: list):
+        """批量将多个数据包添加到表格 — 避免 2000 次 call_from_thread 洪泛"""
+        try:
+            table = self.query_one("#sniff-packet-table", DataTable)
+            for pkt in packets:
+                ts_str = datetime.fromtimestamp(pkt.timestamp).strftime("%H:%M:%S.%f")[:-3]
+                arrow = "OUT→" if pkt.direction == "OUT" else "←IN"
+
+                ptype = pkt.pid_name
+                data_preview = ""
+                if pkt.is_setup:
+                    ptype = "SETUP"
+                    data_preview = "(control)"
+                elif pkt.is_data:
+                    ptype = "DATA"
+                    data_preview = pkt.data[:20].hex()
+                    if pkt.data_len > 20:
+                        data_preview += "..."
+
+                row_key = f"pkt-{self.stats.sniff_packets}"
+                self.stats.sniff_packets += 1
+                table.add_row(
+                    str(self.stats.sniff_packets),
+                    ts_str,
+                    arrow,
+                    f"{pkt.device_addr:02d}",
+                    f"{pkt.endpoint:02x}",
+                    ptype,
+                    str(pkt.data_len),
+                    data_preview,
+                    key=row_key,
+                )
+            # Auto-scroll to bottom
+            try:
+                row_count = table.row_count
+                if row_count > 0:
+                    table.move_cursor(row=row_count - 1, animate=False)
+            except:
+                pass
+        except:
+            pass
+
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted):
         """Wireshark 风格: 高亮行即更新详情"""
         try:
@@ -2065,7 +2324,7 @@ class USBForgeApp(App):
             if not row_key_val.startswith("pkt-"):
                 return
             idx = int(row_key_val.split("-")[1])
-            if idx < len(self.sniffer.packets):
+            if 0 <= idx < len(self.sniffer.packets):
                 pkt = self.sniffer.packets[idx]
                 self._show_packet_detail(pkt)
         except:
@@ -2245,7 +2504,8 @@ class USBForgeApp(App):
                 self._log_analyze(f"  供电: {parsed.get('max_power_ma', '?')} mA")
             elif desc_type == 4:
                 self._log_analyze(f"  接口号: {chunk[2] if len(chunk)>2 else '?'}")
-                self._log_analyze(f"  类: 0x{chunk[5]:02x} 子类: 0x{chunk[6]:02x}")
+                if len(chunk) > 6:
+                    self._log_analyze(f"  类: 0x{chunk[5]:02x} 子类: 0x{chunk[6]:02x}")
             elif desc_type == 5:
                 parsed = parse_endpoint_descriptor(chunk)
                 self._log_analyze(f"  地址: 0x{parsed.get('endpoint_address', 0):02x} ({parsed.get('direction', '?')})")
@@ -2591,7 +2851,9 @@ class USBForgeApp(App):
         profile = PROFILES.get(key)
         if not profile:
             return
-        # 随机变异 VID/PID
+        # 随机变异 VID/PID — 注意不能直接改共享模板，先深拷贝
+        import copy
+        profile = copy.deepcopy(profile)
         rng = random.Random()
         profile.vid = rng.choice([0x05ac, 0x045e, 0x046d, 0x18d1, 0x1d6b, 0xFFFF, 0x0000])
         profile.pid = rng.randint(0, 0xFFFF)
@@ -2692,11 +2954,75 @@ class USBForgeApp(App):
 
     # ── 中继按钮 ──
 
+    @staticmethod
+    def _map_policy(policy_str: str):
+        """将 TUI 策略字符串映射为 RelayPolicy 枚举"""
+        mapping = {
+            "pass": RelayPolicy.PASS_THROUGH,
+            "hold": RelayPolicy.HOLD_ALL,
+            "setup": RelayPolicy.HOLD_SETUP,
+            "data": RelayPolicy.HOLD_DATA,
+            "all": RelayPolicy.HOLD_ALL,  # "all" → HOLD_ALL
+        }
+        return mapping.get(policy_str, RelayPolicy.PASS_THROUGH)
+
     def _on_btn_relay_start(self):
         self._ensure_mode("facedancer", "USB 中继 (MITM)", self._do_relay_start)
 
+    def _on_btn_relay_scan(self):
+        """扫描可代理的 USB 设备"""
+        self._log_relay("[cyan]🔍 扫描 USB 设备...[/]")
+        def _do_scan():
+            devices = list_target_devices()
+            if not devices:
+                self.call_from_thread(self._log_relay,
+                    "[yellow]⚠ 未找到可代理的 USB 设备 (已排除 Cynthion 自身)[/]")
+                self.call_from_thread(self._log_relay,
+                    "[dim]提示: 将目标 USB 设备插入电脑，输入 VID/PID 后启动中继[/]")
+                return
+            self.call_from_thread(self._log_relay,
+                f"[green]✓ 找到 {len(devices)} 个可代理设备:[/]")
+            for d in devices:
+                line = f"  {d['name']}  {d['vid']:#06x}:{d['pid']:#06x}"
+                self.call_from_thread(self._log_relay, f"[white]{line}[/]")
+                # 如果输入框为空，自动填充第一个设备
+                try:
+                    vid_input = self.query_one("#input-relay-vid", Input)
+                    if not vid_input.value.strip():
+                        self.call_from_thread(
+                            lambda v=d['vid']: setattr(
+                                self.query_one("#input-relay-vid", Input), "value", f"0x{v:04x}"))
+                        pid_input = self.query_one("#input-relay-pid", Input)
+                        if not pid_input.value.strip():
+                            self.call_from_thread(
+                                lambda p=d['pid']: setattr(
+                                    self.query_one("#input-relay-pid", Input), "value", f"0x{p:04x}"))
+                except Exception:
+                    pass
+        threading.Thread(target=_do_scan, daemon=True).start()
+
+    def _on_btn_relay_list(self):
+        """列出设备到日志"""
+        self._on_btn_relay_scan()
+
     def _do_relay_start(self):
-        """启动中继模式 — 通过 MCP 捕获真实 USB 流量"""
+        """启动中继模式 — 基于 Facedancer USBProxyDevice 的真实 MITM"""
+        # 获取 VID/PID
+        vid_str = self.query_one("#input-relay-vid", Input).value.strip()
+        pid_str = self.query_one("#input-relay-pid", Input).value.strip()
+
+        if not vid_str or not pid_str:
+            self._log_relay("[red]❌ 请输入目标设备的 VID 和 PID[/]")
+            self._log_relay("[dim]提示: 点击「扫描设备」可自动检测[/]")
+            return
+
+        try:
+            vid = int(vid_str, 0)
+            pid = int(pid_str, 0)
+        except ValueError:
+            self._log_relay("[red]❌ VID/PID 格式错误 (使用 0x 前缀或十进制)[/]")
+            return
+
         policy = self.query_one("#select-relay-policy", Select).value
         self._relay_active = True
         self._relay_policy = policy
@@ -2706,49 +3032,100 @@ class USBForgeApp(App):
         table = self.query_one("#relay-queue-table", DataTable)
         table.clear()
         if not table.columns:
-            table.add_columns("#", "方向", "类型", "设备", "EP", "请求", "长度", "状态")
+            table.add_columns("#", "方向", "类型", "EP", "请求", "长度", "状态")
 
         policy_names = {
-            "pass": "放行所有",
+            "pass": "放行所有 (MITM 透传)",
             "hold": "暂停所有",
             "setup": "拦截 SETUP",
             "data": "拦截 DATA",
             "all": "拦截全部",
         }
 
-        # 初始化 MCP bridge
-        bridge = get_bridge()
-        if not bridge.available:
-            if not bridge.start(timeout=10):
-                self._log_relay("[red]❌ MCP 不可用 — 无法启动真实中继[/]")
-                self._log_relay("[yellow]请确保 Cynthion 已连接并加载 analyzer 固件[/]")
-                self._relay_active = False
-                return
+        self._log_relay(f"[green]▶ 启动 USB MITM 中继[/]")
+        self._log_relay(f"  [cyan]目标设备: {vid:#06x}:{pid:#06x}[/]")
+        self._log_relay(f"  [cyan]策略: {policy_names.get(policy, policy)}[/]")
+        self._log_relay("[dim]TARGET-C→车机(伪装设备), Mac USB→真实设备(libusb)[/]")
 
-        self._log_relay(f"[green]▶ 中继已启动 — 策略: {policy_names.get(policy, policy)}[/]")
-        self._log_relay("[dim]通过 MCP 捕获真实 USB 流量 (Cynthion passthrough)...[/]")
+        # 包回调 — 从 relay 线程调用
+        def _on_packet(pkt: RelayPacket):
+            try:
+                action_icons = {
+                    PacketAction.FORWARDED: "→ 通过",
+                    PacketAction.HELD: "⏸ 拦截",
+                    PacketAction.DROPPED: "🗑 丢弃",
+                    PacketAction.MODIFIED: "🔧 篡改",
+                }
+                icon = action_icons.get(pkt.action, "?")
+                pkt_dict = {
+                    "num": pkt.seq, "dir": pkt.direction, "type": pkt.request[:20] or "-",
+                    "ep": str(pkt.ep_num), "req": "", "len": len(pkt.data),
+                    "status": icon, "data": pkt.data, "action": pkt.action.value,
+                }
 
-        # 启动真实捕获线程
-        self._relay_thread = threading.Thread(target=self._relay_loop_mcp, daemon=True)
-        self._relay_thread.start()
+                def _add_row(pd=pkt_dict):
+                    try:
+                        t = self.query_one("#relay-queue-table", DataTable)
+                        t.add_row(str(pd["num"]), pd["dir"], pd["type"],
+                                  pd["ep"], pd["req"], str(pd["len"]), pd["status"],
+                                  key=str(pd["num"]))
+                    except Exception:
+                        pass
+
+                self.call_from_thread(_add_row)
+
+                # 记录到队列 (用于放行/丢弃/篡改操作)
+                self._relay_queue.append(pkt_dict)
+                if len(self._relay_queue) > 200:
+                    self._relay_queue = self._relay_queue[-100:]
+
+                # 更新统计
+                self.call_from_thread(self._update_relay_stats)
+
+                if pkt.action in (PacketAction.HELD, PacketAction.DROPPED, PacketAction.MODIFIED):
+                    self.call_from_thread(self._log_relay,
+                        f"[yellow]{icon} #{pkt.seq} {pkt.direction} EP{pkt.ep_num} "
+                        f"{pkt.request[:30]} [{len(pkt.data)}B][/]")
+
+            except Exception:
+                pass
+
+        # 创建并启动 relay 引擎
+        self._relay_engine = RelayEngine()
+        ok = self._relay_engine.start(vid, pid, policy=self._map_policy(policy), on_packet=_on_packet)
+
+        if not ok:
+            self._log_relay(f"[red]❌ 中继启动失败: {self._relay_engine.error}[/]")
+            self._relay_active = False
+            return
+
+        # 监控线程 — 定期检查引擎状态
+        def _monitor():
+            while self._relay_active and self._relay_engine and self._relay_engine.is_running:
+                time.sleep(0.5)
+                if self._relay_engine.error:
+                    self.call_from_thread(self._log_relay,
+                        f"[red]❌ 中继错误: {self._relay_engine.error}[/]")
+                    break
+            self.call_from_thread(self._log_relay, "[dim]中继引擎已结束[/]")
+            self._relay_active = False
+
+        threading.Thread(target=_monitor, daemon=True).start()
 
     def _on_btn_relay_stop(self):
         """停止中继"""
         self._relay_active = False
-        # 停止 MCP 捕获
-        bridge = get_bridge()
-        if bridge.available:
+        if self._relay_engine:
             def _do_stop():
-                r = bridge.capture_stop()
-                if r.get("ok"):
-                    data = r.get("data", {})
-                    self.call_from_thread(self._log_relay,
-                        f"[dim]MCP 捕获停止 — {data.get('bytes_written', 0)} bytes[/]")
+                self._relay_engine.stop(timeout=3.0)
+                s = self._relay_engine.get_stats()
+                self.call_from_thread(self._log_relay,
+                    f"[dim]统计: 转发={s.forwarded} 拦截={s.held} 丢弃={s.dropped}[/]")
             threading.Thread(target=_do_stop, daemon=True).start()
         self._log_relay("[red]⏹ 中继已停止[/]")
 
     def _on_btn_relay_forward(self):
-        """放行选中的包 — 标记为已转发"""
+        """放行选中的包 — 通过 RelayFilter 释放"""
         table = self.query_one("#relay-queue-table", DataTable)
         if table.row_count == 0:
             self._log_relay("[yellow]队列为空，无包可操作[/]")
@@ -2757,22 +3134,22 @@ class USBForgeApp(App):
             row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
             if row_key is None:
                 return
-            row_idx = int(row_key.value)
-            if row_idx < len(self._relay_queue):
-                pkt = self._relay_queue[row_idx]
-                if pkt["status"] == "HELD":
-                    pkt["status"] = "FORWARDED"
-                    self.stats.relay_forward += 1
-                    table.update_row(row_key.value, str(row_idx), pkt["dir"], pkt["type"],
-                                     pkt["dev"], pkt["ep"], pkt["req"], str(pkt["len"]),
-                                     "✅ 转发")
-                    self._log_relay(f"[green]✅ 包 #{row_idx} 已放行[/]")
-                    self._update_relay_stats()
+            seq = int(row_key.value)
+
+            # 通过 RelayEngine 释放包
+            if self._relay_engine and self._relay_engine.relay_filter:
+                if self._relay_engine.relay_filter.release_packet(seq):
+                    self._log_relay(f"[green]✅ 包 #{seq} 已放行[/]")
+                    table.update_row(row_key.value, *[table.get_row(row_key)[i] for i in range(6)], "✅ 转发")
+                else:
+                    self._log_relay(f"[yellow]⚠ 包 #{seq} 不在拦截队列中[/]")
+            else:
+                self._log_relay("[yellow]⚠ 中继引擎未运行[/]")
         except Exception as e:
             self._log_relay(f"[red]放行失败: {e}[/]")
 
     def _on_btn_relay_drop(self):
-        """丢弃选中的包"""
+        """丢弃选中的包 — 通过 RelayFilter 丢弃"""
         table = self.query_one("#relay-queue-table", DataTable)
         if table.row_count == 0:
             self._log_relay("[yellow]队列为空，无包可操作[/]")
@@ -2781,218 +3158,62 @@ class USBForgeApp(App):
             row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
             if row_key is None:
                 return
-            row_idx = int(row_key.value)
-            if row_idx < len(self._relay_queue):
-                pkt = self._relay_queue[row_idx]
-                if pkt["status"] == "HELD":
-                    pkt["status"] = "DROPPED"
-                    self.stats.relay_drop += 1
-                    table.update_row(row_key.value, str(row_idx), pkt["dir"], pkt["type"],
-                                     pkt["dev"], pkt["ep"], pkt["req"], str(pkt["len"]),
-                                     "🗑 丢弃")
-                    self._log_relay(f"[red]🗑 包 #{row_idx} 已丢弃[/]")
-                    self._update_relay_stats()
+            seq = int(row_key.value)
+
+            if self._relay_engine and self._relay_engine.relay_filter:
+                if self._relay_engine.relay_filter.drop_packet(seq):
+                    self._log_relay(f"[red]🗑 包 #{seq} 已丢弃[/]")
+                    table.update_row(row_key.value, *[table.get_row(row_key)[i] for i in range(6)], "🗑 丢弃")
+                else:
+                    self._log_relay(f"[yellow]⚠ 包 #{seq} 不在拦截队列中[/]")
+            else:
+                self._log_relay("[yellow]⚠ 中继引擎未运行[/]")
         except Exception as e:
             self._log_relay(f"[red]丢弃失败: {e}[/]")
 
     def _on_btn_relay_send(self):
-        """发送修改后的数据 — 通过 MCP inject_serial 实际注入"""
+        """修改并发送选中的包数据"""
         edit_hex = self.query_one("#input-relay-edit", Input).value.strip()
         table = self.query_one("#relay-queue-table", DataTable)
         if not table.cursor_coordinate or not edit_hex:
             self._log_relay("[yellow]请选择包并输入修改后的 hex 数据[/]")
             return
-        row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
-        if row_key is None:
-            return
         try:
-            row_idx = int(row_key.value)
-            if row_idx < len(self._relay_queue):
-                pkt = self._relay_queue[row_idx]
-                # 解析 hex
-                modified_bytes = bytes.fromhex(edit_hex.replace(" ", ""))
-                pkt["data"] = modified_bytes
-                pkt["status"] = "MODIFIED"
-                pkt["len"] = len(modified_bytes)
-                self.stats.relay_modify += 1
-                table.update_row(row_key.value, str(row_idx), pkt["dir"], pkt["type"],
-                                 pkt["dev"], pkt["ep"], pkt["req"], str(pkt["len"]),
-                                 "🔧 已篡改")
-                self._log_relay(f"[yellow]🔧 包 #{row_idx} 数据已修改 ({len(modified_bytes)} bytes)[/]")
-                self._update_relay_stats()
+            modified_bytes = bytes.fromhex(edit_hex.replace(" ", ""))
+            row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+            if row_key is None:
+                return
+            seq = int(row_key.value)
 
-                # 通过 MCP inject_serial 实际发送修改后的数据
-                bridge = get_bridge()
-                if not bridge.available:
-                    self._log_relay("[yellow]⚠ MCP 不可用，无法实际发送 — 数据仅标记为已篡改[/]")
-                    return
-
-                self._log_relay("[dim]正在通过 MCP 发送修改后的数据...[/]")
-
-                def _do_inject():
-                    # inject_serial 要求 facedancer 模式 + 活跃的 FTDI 仿真
-                    # 先尝试直接注入
-                    r = bridge.inject_serial(modified_bytes.decode("latin-1"))
-                    if r.get("ok"):
-                        self.call_from_thread(self._log_relay,
-                            f"[green]✅ 已通过 MCP 发送 {len(modified_bytes)} bytes 修改数据[/]")
-                    else:
-                        err = r.get("error", "?")
-                        self.call_from_thread(self._log_relay,
-                            f"[yellow]⚠ inject_serial 失败: {err}[/]")
-                        self.call_from_thread(self._log_relay,
-                            "[dim]提示: 篡改注入需要先在「伪造」标签页启动 FTDI 设备仿真[/]")
-
-                threading.Thread(target=_do_inject, daemon=True).start()
+            engine = self._relay_engine
+            if not engine or not engine.relay_filter:
+                self._log_relay("[yellow]⚠ 中继引擎未运行[/]")
+                return
+            if engine.relay_filter.modify_packet(seq, modified_bytes):
+                self._log_relay(
+                    f"[green]🔧 包 #{seq} 已排队篡改: {len(modified_bytes)} bytes → "
+                    f"{modified_bytes.hex()[:32]}{'...' if len(modified_bytes) > 16 else ''}[/]")
+            else:
+                self._log_relay(f"[yellow]⚠ 找不到包 #{seq} — 可能已超出记录范围[/]")
+            self._update_relay_stats()
 
         except ValueError:
             self._log_relay("[red]hex 格式错误[/]")
         except Exception as e:
             self._log_relay(f"[red]发送失败: {e}[/]")
 
-    def _relay_loop_mcp(self):
-        """真实中继数据流 — 通过 MCP capture 捕获 USB 流量并实时显示
-
-        流程:
-          1. bridge.capture_start() 启动 passthrough 捕获
-          2. 轮询 capture_status，定期 dissect_packets 获取新包
-          3. 将真实包转为 relay_queue 条目
-          4. 根据 policy 决定 HELD/FORWARDED
-        """
-        bridge = get_bridge()
-
-        # 1) 启动 MCP 捕获
-        r = bridge.capture_start("auto")
-        if not r.get("ok"):
-            self.call_from_thread(self._log_relay,
-                f"[red]❌ MCP 捕获启动失败: {r.get('error', '?')}[/]")
-            self._relay_active = False
-            return
-
-        cap_data = r.get("data", {})
-        capture_id = cap_data.get("id", "")
-        self._relay_capture_id = capture_id
-        self.call_from_thread(self._log_relay,
-            f"[green]✓ MCP 捕获已启动 (ID: {capture_id})[/]")
-
-        # 2) 实时轮询 — 定期 dissect 新包
-        counter = 0
-        last_packet_count = 0
-        poll_interval = 1.0  # 每 1 秒 dissect 一次
-
-        while getattr(self, "_relay_active", False):
-            time.sleep(poll_interval)
-            if not getattr(self, "_relay_active", False):
-                break
-
-            # 检查捕获状态
-            st = bridge.capture_status()
-            if not st.get("ok"):
-                break
-
-            # 获取最新数据包
-            r = bridge.dissect_packets(capture_id, limit=200)
-            if not r.get("ok"):
-                continue
-
-            data = r.get("data", {})
-            pkts = data.get("packets", [])
-
-            # 只处理新增的包
-            new_pkts = pkts[last_packet_count:]
-            last_packet_count = len(pkts)
-
-            for p in new_pkts:
-                counter += 1
-                pid_name = p.get("pid_name", "?")
-                dev = str(p.get("device", 0))
-                ep = str(p.get("endpoint", 0))
-                src = p.get("src", "")
-                dst = p.get("dst", "")
-                direction = "OUT→" if "host" in src.lower() else "←IN"
-                extra = p.get("extra", {})
-                # 提取数据长度
-                data_len = 0
-                pkt_data = b""
-                for k, v in extra.items():
-                    if isinstance(v, str) and all(c in "0123456789abcdef:" for c in v.lower()):
-                        try:
-                            pkt_data = bytes.fromhex(v.replace(":", ""))
-                            data_len = len(pkt_data)
-                            break
-                        except ValueError:
-                            pass
-
-                # 请求类型 (SETUP 请求码)
-                req_str = ""
-                if pid_name == "SETUP" and pkt_data:
-                    req_str = f"0x{pkt_data[1]:02x}" if len(pkt_data) > 1 else "-"
-
-                policy = getattr(self, "_relay_policy", "pass")
-                should_hold = False
-                if policy == "hold":
-                    should_hold = True
-                elif policy == "setup" and pid_name == "SETUP":
-                    should_hold = True
-                elif policy == "data" and pid_name in ("DATA0", "DATA1", "DATA2"):
-                    should_hold = True
-                elif policy == "all":
-                    should_hold = True
-
-                pkt = {
-                    "num": counter, "dir": direction, "type": pid_name,
-                    "dev": dev, "ep": ep, "req": req_str,
-                    "len": data_len, "status": "HELD" if should_hold else "FORWARDED",
-                    "data": pkt_data,
-                }
-
-                status_icon = "⏸ 拦截" if should_hold else "→ 通过"
-                pkt_copy = pkt.copy()
-
-                def _add_row(p=pkt_copy, si=status_icon):
-                    try:
-                        table = self.query_one("#relay-queue-table", DataTable)
-                        table.add_row(str(p["num"]), p["dir"], p["type"],
-                                      p["dev"], p["ep"], p["req"],
-                                      str(p["len"]), si,
-                                      key=str(p["num"]))
-                    except:
-                        pass
-
-                try:
-                    self.call_from_thread(_add_row)
-                except:
-                    pass
-
-                if should_hold:
-                    self._relay_queue.append(pkt)
-                    self.stats.relay_hold += 1
-                    self.call_from_thread(self._log_relay,
-                        f"[yellow]⏸ #{counter} {direction} {pid_name} dev={dev} ep={ep} 已拦截[/]")
-                else:
-                    self.stats.relay_forward += 1
-
-                self.call_from_thread(self._update_relay_stats)
-
-                # 队列限制
-                if len(self._relay_queue) > 200:
-                    self._relay_queue = self._relay_queue[-100:]
-
-        # 3) 捕获结束
-        self.call_from_thread(self._log_relay,
-            f"[dim]中继捕获结束 — 共 {counter} 个真实包[/]")
-
     def _update_relay_stats(self):
-        """更新中继统计"""
+        """更新中继统计 — 从 RelayEngine 读取真实数据"""
         try:
-            self.query_one("#relay-stat-forward", Label).update(
-                f"已转发: {getattr(self.stats, 'relay_forward', 0)}")
-            self.query_one("#relay-stat-hold", Label).update(
-                f"已拦截: {getattr(self.stats, 'relay_hold', 0)}")
-            self.query_one("#relay-stat-drop", Label).update(
-                f"已丢弃: {getattr(self.stats, 'relay_drop', 0)}")
-            self.query_one("#relay-stat-modify", Label).update(
-                f"已篡改: {getattr(self.stats, 'relay_modify', 0)}")
+            if self._relay_engine and self._relay_engine.relay_filter:
+                s = self._relay_engine.relay_filter.stats
+                fwd, held, drop, mod = s.forwarded, s.held, s.dropped, s.modified
+            else:
+                fwd = held = drop = mod = 0
+            self.query_one("#relay-stat-forward", Label).update(f"已转发: {fwd}")
+            self.query_one("#relay-stat-hold", Label).update(f"已拦截: {held}")
+            self.query_one("#relay-stat-drop", Label).update(f"已丢弃: {drop}")
+            self.query_one("#relay-stat-modify", Label).update(f"已篡改: {mod}")
         except:
             pass
 
@@ -3057,6 +3278,7 @@ class USBForgeApp(App):
         monitor_mode = "noshell"
         target_ip = ""
         ssh_user = ""
+        adb_pass = ""  # 初始化以防 ADB 分支未设置
         if conn_type == "noshell":
             monitor_mode = "noshell"
         elif conn_type == "ssh":
@@ -3079,7 +3301,12 @@ class USBForgeApp(App):
                 if target_ip:
                     target_ip = f"{target_ip}:{adb_port}"
                 adb_pass = self.query_one("#fuzz-adb-wireless-pass", Input).value.strip()
-            monitor_mode = "noshell"
+            # 有密码 → 使用 Root/User shell 监控（验证后可读 dmesg/logcat）
+            # 无密码 → 回退到无 Shell 模式（仅 ping + TCP 端口探测）
+            if adb_pass:
+                monitor_mode = "root"  # 先尝试 root，RootShellMonitor 会自动降级
+            else:
+                monitor_mode = "noshell"
         elif conn_type == "uart":
             serial_dev = self.query_one("#fuzz-uart-port", Select).value
             baud = self.query_one("#fuzz-uart-baud", Input).value.strip() or "115200"
@@ -3119,11 +3346,12 @@ class USBForgeApp(App):
                 self._monitor = None
                 self._log_fuzz_info("[dim]无Shell模式 — 仅依赖 USB 枚举变化检测[/]")
             elif conn_type == "uart":
+                # UART 目标不能走 ICMP/TCP 探测 — 串口路径不是 IP, ping 会对
+                # 串口路径产生误报。用 SerialMonitor 探测串口节点是否消失。
                 self._monitor = create_monitor(
-                    mode="noshell", target_ip=target_ip or _SERIAL_DEFAULT,
-                    ssh_user=ssh_user,
+                    mode="serial", target_ip=target_ip or _SERIAL_DEFAULT,
                 )
-                self._log_fuzz_info(f"[green]✓ 串口监控: {target_ip}[/]")
+                self._log_fuzz_info(f"[green]✓ 串口监控: {target_ip} (节点消失检测)[/]")
             elif conn_type == "ssh":
                 self._monitor = create_monitor(
                     mode=monitor_mode, target_ip=target_ip, ssh_user=ssh_user,
@@ -3131,11 +3359,25 @@ class USBForgeApp(App):
                 self._monitor.set_baseline()
                 self._log_fuzz_info(f"[green]✓ SSH监控就绪: {ssh_user}@{target_ip} ({monitor_mode})[/]")
             elif conn_type == "adb":
+                # 提取 adb_serial (格式: "adb:serial" 或 "IP:port")
+                adb_serial_val = None
+                if target_ip.startswith("adb:"):
+                    serial_raw = target_ip[4:]
+                    if serial_raw and serial_raw != "auto":
+                        adb_serial_val = serial_raw
+                elif ":" in target_ip:
+                    adb_serial_val = target_ip  # "192.168.1.100:5555"
+
                 self._monitor = create_monitor(
-                    mode="noshell", target_ip=target_ip or "127.0.0.1",
+                    mode=monitor_mode, target_ip=target_ip or "127.0.0.1",
                     ssh_user=ssh_user,
+                    adb_serial=adb_serial_val,
+                    adb_password=adb_pass or None,
                 )
-                self._log_fuzz_info(f"[green]✓ ADB监控就绪: {target_ip or 'auto'}[/]")
+                if adb_pass:
+                    self._log_fuzz_info(f"[green]✓ ADB shell 监控就绪: {target_ip or 'auto'} (verify-password 模式)[/]")
+                else:
+                    self._log_fuzz_info(f"[green]✓ ADB 监控就绪: {target_ip or 'auto'} (无 Shell 模式)[/]")
             if self._monitor:
                 self._monitor.set_baseline()
         except Exception as e:
@@ -3229,9 +3471,7 @@ class USBForgeApp(App):
             asyncio.set_event_loop(loop)
 
             from facedancer import USBDevice, USBConfiguration, USBInterface, USBEndpoint
-            from facedancer.core import FacedancerUSBApp
             from facedancer.types import USBDirection, USBTransferType, DeviceSpeed
-            from facedancer.classes.hid import HIDClassSubclass
 
             # 解析设备描述符
             dev_desc = case.device_descriptor
@@ -3285,105 +3525,228 @@ class USBForgeApp(App):
             hid_desc = case.hid_report_descriptor
 
             from facedancer import standard_request_handler
-            from facedancer.types import USBDescriptorType
-            from facedancer.classes.hid import HIDDescriptor
+            from facedancer.types import USBStandardRequests
+            from facedancer import use_inner_classes_automatically
+            from facedancer.errors import EndEmulation
 
-            class FuzzDevice(USBDevice):
-                vendor_id               = vid
-                product_id              = pid
-                device_revision         = 0x0100
-                manufacturer_string     = "FuzzCorp"
-                product_string          = f"FuzzDevice-{case.case_id}"
-                serial_number_string    = f"FUZZ{case.case_id:08d}"
-                device_class            = dev_class
-                device_subclass         = dev_sub
-                protocol_revision_number = dev_proto
+            # ── 解析 disconnect_on_req / class_request_handler 字段 ──
+            disconnect_trigger = case.disconnect_on_req
+            raw_bm_req = None
+            raw_breq = None
+            if case.class_request_handler and case.class_request_handler.startswith("RAW:"):
+                try:
+                    _parts = case.class_request_handler[4:].split(":")
+                    raw_bm_req = int(_parts[0], 16)
+                    raw_breq = int(_parts[1], 16)
+                except (IndexError, ValueError):
+                    raw_bm_req = raw_breq = None
+            _disconnect_flag = {"hit": False}
 
-                @standard_request_handler(number=USBDescriptorType.STANDARD_GET_DESCRIPTOR)
-                def handle_get_descriptor(self, request):
-                    """拦截 GET_DESCRIPTOR — 返回变异描述符"""
-                    import time as _time
-                    if delay_s > 0:
-                        _time.sleep(delay_s)
-                    if stall_ep0:
-                        request.stall()
-                        return
-                    desc_type = (request.value >> 8) & 0xFF
-                    if desc_type == 0x01:  # Device
-                        data = dev_desc or bytes(18)
-                        request.reply(data[:request.length or len(data)])
-                    elif desc_type == 0x02:  # Configuration
-                        data = cfg_desc or bytes(9)
-                        request.reply(data[:request.length or len(data)])
-                    elif desc_type == 0x03:  # String
-                        request.reply(b'\x04\x03\x09\x04')
-                    elif desc_type == 0x22 and hid_desc:  # HID Report
-                        request.reply(hid_desc[:request.length or len(hid_desc)])
-                    else:
-                        request.reply(ctrl_response[:request.length or 64])
+            def _disconnect_triggered(number: int, desc_type: int = 0, w_length: int = 0) -> bool:
+                """枚举断连触发判断 — 依据 disconnect_on_req 值"""
+                if disconnect_trigger == "SET_ADDR":
+                    return number == 0x05
+                if disconnect_trigger == "SET_CONFIG":
+                    return number == 0x09
+                if disconnect_trigger == "GET_DESC":
+                    return number == 0x06 and desc_type == 0x01
+                if disconnect_trigger == "GET_FULL_DESC":
+                    return number == 0x06 and desc_type == 0x01 and w_length >= 18
+                if disconnect_trigger == "GET_CONFIG":
+                    return number == 0x06 and desc_type == 0x02
+                if disconnect_trigger == "RAPID_RECONNECT":
+                    return number in (0x05, 0x06, 0x09)
+                return False
 
-                @standard_request_handler
-                def handle_all(self, request):
-                    """通用控制请求处理"""
-                    import time as _time
-                    if delay_s > 0:
-                        _time.sleep(delay_s)
-                    if stall_ep0:
-                        request.stall()
-                        return
-                    if request.request in (0x05, 0x09):  # SET_ADDRESS, SET_CONFIGURATION
-                        request.ack()
-                    elif request.request == 0x00:  # GET_STATUS
-                        request.reply(b'\x00\x00')
-                    else:
-                        resp = ctrl_response[:request.length or 0]
-                        if resp:
-                            request.reply(resp)
+            # ── Phase 16: RAW_INJECTION — 直接覆写描述符方法 ──
+            if case.raw_inject:
+                _raw_dev = dev_desc or bytes(18)
+                _raw_cfg = cfg_desc or bytes(9)
+                _raw_hid = hid_desc
+
+                @use_inner_classes_automatically
+                class FuzzDevice(USBDevice):
+                    device_speed = DeviceSpeed.FULL
+                    vendor_id              = vid
+                    product_id             = pid
+                    device_revision        = 0x0100
+                    manufacturer_string    = "FuzzCorp"
+                    product_string         = f"FuzzDevice-{case.case_id}"
+                    serial_number_string   = f"FUZZ{case.case_id:08d}"
+                    device_class           = dev_class
+                    device_subclass        = dev_sub
+                    protocol_revision_number = dev_proto
+
+                    class _Configuration(USBConfiguration):
+                        configuration_string = "Fuzz Config"
+                        max_power = 50
+
+                        class _Interface(USBInterface):
+                            interface_number = 0
+
+                            class _InEndpoint(USBEndpoint):
+                                number = 1
+                                direction = USBDirection.IN
+                                transfer_type = USBTransferType.INTERRUPT
+                                interval = 10
+                                max_packet_size = 8
+
+                            def get_report_descriptor(self):
+                                return _raw_hid or bytes([0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0xC0])
+
+                    def get_descriptor(self):
+                        """覆写 — 返回原始畸形设备描述符"""
+                        return _raw_dev
+
+                    def get_configuration_descriptor(self, index):
+                        """覆写 — 返回原始畸形配置描述符"""
+                        return _raw_cfg
+
+            # ── Phase 1-15: request-handler 拦截模式 ──
+            else:
+                class FuzzDevice(USBDevice):
+                    vendor_id               = vid
+                    product_id              = pid
+                    device_revision         = 0x0100
+                    manufacturer_string     = "FuzzCorp"
+                    product_string          = f"FuzzDevice-{case.case_id}"
+                    serial_number_string    = f"FUZZ{case.case_id:08d}"
+                    device_class            = dev_class
+                    device_subclass         = dev_sub
+                    protocol_revision_number = dev_proto
+
+                    @standard_request_handler(number=USBStandardRequests.GET_DESCRIPTOR)
+                    def handle_get_descriptor(self, request):
+                        """拦截 GET_DESCRIPTOR — 返回变异描述符"""
+                        import time as _time
+                        if delay_s > 0:
+                            _time.sleep(delay_s)
+                        if stall_ep0:
+                            request.stall()
+                            return
+                        desc_type = (request.value >> 8) & 0xFF
+                        if _disconnect_triggered(0x06, desc_type, request.length or 0):
+                            _disconnect_flag["hit"] = True
+                        if desc_type == 0x01:  # Device
+                            data = dev_desc or bytes(18)
+                            request.reply(data[:request.length or len(data)])
+                        elif desc_type == 0x02:  # Configuration
+                            data = cfg_desc or bytes(9)
+                            request.reply(data[:request.length or len(data)])
+                        elif desc_type == 0x03:  # String
+                            request.reply(b'\x04\x03\x09\x04')
+                        elif desc_type == 0x22 and hid_desc:  # HID Report
+                            request.reply(hid_desc[:request.length or len(hid_desc)])
                         else:
+                            request.reply(ctrl_response[:request.length or 64])
+
+                    @standard_request_handler()
+                    def handle_all(self, request):
+                        """通用控制请求处理"""
+                        # GET_DESCRIPTOR 由 handle_get_descriptor 专用处理，这里跳过
+                        if request.number == 0x06:
+                            return
+                        import time as _time
+                        if delay_s > 0:
+                            _time.sleep(delay_s)
+                        if _disconnect_triggered(request.number):
+                            _disconnect_flag["hit"] = True
+                        if stall_ep0:
+                            request.stall()
+                            return
+                        # RAW 类请求 — 对任意 bmRequestType/bRequest 组合回填 fuzz 数据
+                        if raw_breq is not None and request.number == raw_breq:
+                            request.reply(ctrl_response[:request.length or 0])
+                            return
+                        if request.number in (0x05, 0x09):  # SET_ADDRESS, SET_CONFIGURATION
                             request.ack()
+                        elif request.number == 0x00:  # GET_STATUS
+                            request.reply(b'\x00\x00')
+                        else:
+                            resp = ctrl_response[:request.length or 0]
+                            if resp:
+                                request.reply(resp)
+                            else:
+                                request.ack()
 
             device = FuzzDevice()
 
-            # 添加配置和接口
-            class FuzzConfig(USBConfiguration):
-                configuration_string = "Fuzz Config"
-                max_power = 100
+            if not case.raw_inject:
+                # ── Phase 1-15: 手动构建配置+接口+端点 ──
+                class FuzzConfig(USBConfiguration):
+                    configuration_string = "Fuzz Config"
+                    max_power = 100
 
-            config = FuzzConfig()
-            for iface_info in interfaces_parsed:
-                iface = USBInterface(
-                    number=iface_info["number"],
-                    class_number=iface_info["class"],
-                    subclass_number=iface_info["subclass"],
-                    protocol_number=iface_info["protocol"],
-                )
-                for ep_info in iface_info["endpoints"]:
-                    ep_addr = ep_info["addr"]
-                    ep_attr = ep_info["attrs"]
-                    ep_type_val = (ep_attr >> 0) & 0x03
-                    ep_type_map = {
-                        0: USBTransferType.CONTROL,
-                        1: USBTransferType.ISOCHRONOUS,
-                        2: USBTransferType.BULK,
-                        3: USBTransferType.INTERRUPT,
-                    }
-                    ep = USBEndpoint(
-                        number=ep_addr & 0x0F,
-                        direction=USBDirection.IN if (ep_addr & 0x80) else USBDirection.OUT,
-                        transfer_type=ep_type_map.get(ep_type_val, USBTransferType.INTERRUPT),
-                        max_packet_size=ep_info["mps"],
+                config = FuzzConfig()
+                for iface_info in interfaces_parsed:
+                    iface = USBInterface(
+                        number=iface_info["number"],
+                        class_number=iface_info["class"],
+                        subclass_number=iface_info["subclass"],
+                        protocol_number=iface_info["protocol"],
                     )
-                    iface.add_endpoint(ep)
-                config.add_interface(iface)
-            device.add_configuration(config)
+                    for ep_info in iface_info["endpoints"]:
+                        ep_addr = ep_info["addr"]
+                        ep_attr = ep_info["attrs"]
+                        ep_type_val = (ep_attr >> 0) & 0x03
+                        ep_type_map = {
+                            0: USBTransferType.CONTROL,
+                            1: USBTransferType.ISOCHRONOUS,
+                            2: USBTransferType.BULK,
+                            3: USBTransferType.INTERRUPT,
+                        }
+                        ep = USBEndpoint(
+                            number=ep_addr & 0x0F,
+                            direction=USBDirection.IN if (ep_addr & 0x80) else USBDirection.OUT,
+                            transfer_type=ep_type_map.get(ep_type_val, USBTransferType.INTERRUPT),
+                            max_packet_size=ep_info["mps"],
+                        )
+                        iface.add_endpoint(ep)
+                    config.add_interface(iface)
+                device.add_configuration(config)
 
-            # 连接并仿真
-            app = FacedancerUSBApp()
-            device.connect(app)
+            # 连接并仿真 (connect() 内部自动创建后端，不要传入 app 作为 device_speed)
+            device.connect()
 
             # 等待主机枚举（留出时间让目标主机处理恶意设备）
             enum_wait = max(2.0, delay_s)
             loop.run_until_complete(asyncio.sleep(enum_wait))
+
+            # Phase 3: disconnect_on_req — 触发条件满足后在枚举中断连
+            if _disconnect_flag["hit"]:
+                try:
+                    device.disconnect()
+                    loop.run_until_complete(asyncio.sleep(0.5))
+                except Exception:
+                    pass
+                if disconnect_trigger == "RAPID_RECONNECT":
+                    # 快速重连循环 — 模拟设备反复出现/消失
+                    for _cycle in range(4):
+                        try:
+                            _d2 = FuzzDevice()
+                            _d2.connect()
+                            loop.run_until_complete(asyncio.sleep(0.4))
+                            _d2.disconnect()
+                            loop.run_until_complete(asyncio.sleep(0.3))
+                        except Exception:
+                            pass
+
+            # Phase 16: stress_repeat — 高频重复连接/断开
+            if case.stress_repeat and case.stress_repeat > 1:
+                for _rep in range(case.stress_repeat - 1):
+                    loop.run_until_complete(asyncio.sleep(0.5))
+                    try:
+                        device.disconnect()
+                    except Exception:
+                        pass
+                    loop.run_until_complete(asyncio.sleep(0.3))
+                    try:
+                        device2 = FuzzDevice()
+                        device2.connect()
+                        loop.run_until_complete(asyncio.sleep(enum_wait))
+                        device2.disconnect()
+                    except Exception:
+                        pass
 
             # Phase 4: 如果有端点数据，通过 EP 发送
             if case.ep_data_override:

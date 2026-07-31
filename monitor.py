@@ -19,6 +19,7 @@ import socket
 import select
 import hashlib
 import json
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -66,37 +67,166 @@ class CrashDetail:
 # SSH 连接管理
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class AdbInteractiveSession:
+    """持久化 ADB 交互式 shell — 支持 verify-password 设备。
+
+    某些定制 Android 设备（如车载 C281MCA2）在 adb shell 上加装了
+    密码验证拦截器，导致 `adb shell <cmd>` 单次执行模式无限循环
+    "verify failed"。本类维持一个持久交互式 shell 会话，首次验证
+    后复用同一 shell 执行多条命令。
+    """
+
+    def __init__(self, adb_serial: Optional[str], password: Optional[str]):
+        self.adb_serial = adb_serial
+        self.password = password
+        self._proc: Optional[subprocess.Popen] = None
+        self._authenticated = False
+        self._lock = threading.Lock()
+
+    def _build_adb_args(self) -> list[str]:
+        args = ["adb"]
+        if self.adb_serial:
+            args.extend(["-s", self.adb_serial])
+        args.append("shell")
+        return args
+
+    def _connect(self) -> bool:
+        """启动交互式 shell 并完成密码验证（如需要）。"""
+        try:
+            self._proc = subprocess.Popen(
+                self._build_adb_args(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        except Exception:
+            return False
+
+        # 等待 prompt
+        time.sleep(0.3)
+        ready, _, _ = select.select([self._proc.stdout], [], [], 3.0)
+        if not ready:
+            # 无密码提示 → 可能直接进入 shell
+            self._authenticated = True
+            return True
+
+        prompt = self._proc.stdout.read1(4096).decode(errors="replace")
+        if "password" in prompt.lower():
+            if not self.password:
+                self._authenticated = False
+                return False
+            self._proc.stdin.write(f"{self.password}\n".encode())
+            self._proc.stdin.flush()
+            time.sleep(0.8)
+            ready, _, _ = select.select([self._proc.stdout], [], [], 2.0)
+            if ready:
+                resp = self._proc.stdout.read1(4096).decode(errors="replace")
+                if "success" in resp.lower():
+                    self._authenticated = True
+                    return True
+            return False
+
+        # 无密码提示 → 直接可用
+        self._authenticated = True
+        return True
+
+    def run(self, command: str, timeout: float = 10.0) -> tuple[int, str]:
+        """在交互式 shell 中执行命令，返回 (exit_code, stdout)。"""
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                if not self._connect():
+                    return -1, "ADB shell 认证失败 (verify password)"
+
+            try:
+                # 用唯一标记包裹命令以分离输出
+                marker = f"__USBFORGE_{time.time_ns()}__"
+                wrapped = f"echo START{marker}; {command}; echo EXIT{marker}_$?\n"
+                self._proc.stdin.write(wrapped.encode())
+                self._proc.stdin.flush()
+
+                deadline = time.monotonic() + timeout
+                buf = b""
+                while time.monotonic() < deadline:
+                    ready, _, _ = select.select([self._proc.stdout], [], [], 1.0)
+                    if ready:
+                        chunk = self._proc.stdout.read1(8192)
+                        if chunk:
+                            buf += chunk
+                            text = buf.decode(errors="replace")
+                            if f"EXIT{marker}_" in text:
+                                # 解析输出和退出码
+                                start_tag = f"START{marker}\n"
+                                end_tag = f"EXIT{marker}_"
+                                start_idx = text.find(start_tag)
+                                end_idx = text.find(end_tag)
+                                if start_idx >= 0 and end_idx >= 0:
+                                    output = text[start_idx + len(start_tag):end_idx]
+                                    # 提取退出码
+                                    after_end = text[end_idx + len(end_tag):]
+                                    exit_code = 0
+                                    try:
+                                        exit_code = int(after_end.strip().split("\n")[0].strip())
+                                    except (ValueError, IndexError):
+                                        pass
+                                    return exit_code, output
+                return -1, "TIMEOUT"
+            except Exception as e:
+                return -1, str(e)
+
+    def close(self):
+        if self._proc:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            self._proc = None
+            self._authenticated = False
+
+
 class SSHConnection:
-    """SSH 连接封装 — 支持 adb shell 和 ssh 两种方式"""
+    """SSH/ADB 连接封装 — 支持 ssh、adb（单次）和 adb 交互式（密码设备）"""
 
     def __init__(self, target: str, mode: str = "ssh", port: int = 22,
-                 user: str = "root", adb_serial: Optional[str] = None):
+                 user: str = "root", adb_serial: Optional[str] = None,
+                 adb_password: Optional[str] = None):
         """
         target: IP 地址
         mode:   "ssh" | "adb"
         port:   SSH 端口
         user:   SSH 用户名
         adb_serial: adb 设备序列号 (mode="adb" 时使用)
+        adb_password: ADB shell verify-password (定制设备)
         """
         self.target = target
         self.mode = mode
         self.port = port
         self.user = user
         self.adb_serial = adb_serial
+        self.adb_password = adb_password
+        self._interactive: Optional[AdbInteractiveSession] = None
 
     def run(self, command: str, timeout: float = 10.0) -> tuple[int, str]:
         """执行远程命令，返回 (exit_code, stdout)"""
         try:
             if self.mode == "adb":
+                # 如果设了密码，走交互式 shell（避免 verify-password 死循环）
+                if self.adb_password:
+                    if self._interactive is None:
+                        self._interactive = AdbInteractiveSession(self.adb_serial, self.adb_password)
+                    return self._interactive.run(command, timeout)
+
+                # 无密码 → 标准单次执行
                 args = ["adb"]
                 if self.adb_serial:
                     args.extend(["-s", self.adb_serial])
                 args.extend(["shell", command])
+                result = subprocess.run(args, capture_output=True, timeout=timeout, text=True)
+                return result.returncode, result.stdout + result.stderr
             else:
                 args = ["ssh", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no",
                         "-p", str(self.port), f"{self.user}@{self.target}", command]
-            result = subprocess.run(args, capture_output=True, timeout=timeout, text=True)
-            return result.returncode, result.stdout + result.stderr
+                result = subprocess.run(args, capture_output=True, timeout=timeout, text=True)
+                return result.returncode, result.stdout + result.stderr
         except subprocess.TimeoutExpired:
             return -1, "TIMEOUT"
         except FileNotFoundError:
@@ -287,6 +417,60 @@ class NoShellMonitor(BaseMonitor):
         """等待目标重启恢复"""
         for _ in range(30):  # 最多等 150 秒
             if self._ping():
+                return True
+            time.sleep(5)
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UART — 串口控制台目标
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SerialMonitor(BaseMonitor):
+    """
+    UART 串口目标监控 — 目标通过 USB 转串口适配器挂在主机上。
+
+    崩溃检测: 若目标死机导致 USB 断开, 串口设备节点 (如 /dev/ttyUSB0)
+    会消失; 反复探测不到设备节点视为崩溃。不做 ICMP/TCP 探测 —
+    串口路径不是 IP, NoShellMonitor 的 ping 会对串口路径产生误报。
+    """
+
+    def __init__(self, serial_dev: str, disappear_threshold: int = 3,
+                 check_interval: float = 1.0):
+        super().__init__("UART串口监控 (设备节点探测)")
+        self.serial_dev = serial_dev
+        self.disappear_threshold = disappear_threshold
+        self.check_interval = check_interval
+        self._alive = True
+
+    def _device_exists(self) -> bool:
+        try:
+            return os.path.exists(self.serial_dev)
+        except Exception:
+            return False
+
+    def check(self) -> CrashDetail:
+        detail = CrashDetail(timestamp=time.time())
+        if self.serial_dev in ("auto", "", "/dev/ttyUSB0"):
+            # 未知串口 → 无法探测, 不产生误报
+            return detail
+        miss = 0
+        for _ in range(self.disappear_threshold):
+            if self._device_exists():
+                miss = 0
+                break
+            miss += 1
+            time.sleep(self.check_interval)
+        if miss >= self.disappear_threshold:
+            detail.level = CrashLevel.CRASH
+            detail.summary = f"串口设备 {self.serial_dev} 消失 (USB 断开) — 目标可能已死机"
+            detail.details.append(f"连续 {miss} 次探测不到串口节点")
+            self._alive = False
+        return detail
+
+    def recover(self) -> bool:
+        for _ in range(30):
+            if self._device_exists():
                 return True
             time.sleep(5)
         return False
@@ -536,13 +720,17 @@ def create_monitor(
     ssh_port: int = 22,
     adb_serial: Optional[str] = None,
     tcp_ports: Optional[list[int]] = None,
+    adb_password: Optional[str] = None,
 ) -> BaseMonitor:
     """
     根据场景创建监控后端
 
-    mode: "noshell" | "user" | "root"
+    mode: "noshell" | "user" | "root" | "serial"
+    adb_password: ADB shell verify-password (定制设备，如车载 Android)
     """
-    if mode == "noshell":
+    if mode == "serial":
+        return SerialMonitor(serial_dev=target_ip or "/dev/ttyUSB0")
+    elif mode == "noshell":
         return NoShellMonitor(
             target_ip=target_ip or "192.168.1.1",
             tcp_ports=tcp_ports,
@@ -556,6 +744,7 @@ def create_monitor(
             port=ssh_port,
             user=ssh_user,
             adb_serial=adb_serial,
+            adb_password=adb_password,
         )
         if mode == "root":
             return RootShellMonitor(conn)
